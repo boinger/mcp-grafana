@@ -162,6 +162,8 @@ Queries go through Grafana's Snowflake datasource (Grafana Enterprise plugin `gr
 - **Inspect evaluators and templates:** Read the evaluators a score came from, the templates they were derived from, and the judge providers and models available to LLM-judge evaluators. With write tools enabled, also create, fork, test, and delete evaluators.
 - **Inspect eval rules and guards:** Read the asynchronous eval rules that bind evaluators to production traffic, and the guards (hook rules) that run inline and can warn or deny. With write tools enabled, also create, update, preview, and delete them. Writes and the non-persisting `preview_rule` and `test_evaluator` operations need the `grafana-agento11y-app.eval:write` permission, granted by the Agento11y Admin role.
 - **Curate saved conversations and collections:** Read the saved conversations (bookmarks that give a conversation a stable ID, name, and tags) and the collections that group them, including each collection's member count and the collections embedded in every saved-conversation row. With write tools enabled, also bookmark a conversation, create and edit collections, and add or remove members. These writes need the same `grafana-agento11y-app.eval:write` permission.
+- **Read and edit test suites:** List the versioned test suites that offline experiments run against, read one with its full version history, and page through the test cases of a version. With write tools enabled, also create a suite, rename or retag it, open a draft version, publish it, and write or delete its test cases. A published version is frozen, so an edit means opening a new draft. These writes need `grafana-agento11y-app.eval:write`.
+- **Read offline experiments:** List the evaluation runs over a test suite and read one with its headline pass rate, cost, and token totals. Drill down through a per-test-case report to trials, their scores with each judge's explanation, and their artifact metadata. With write tools enabled, also rename or retag an experiment and cancel a running one, which need `grafana-agento11y-app.eval:write`. Experiments are created by SDK runners, not by this tool.
 
 ### Grafana Assistant
 
@@ -171,7 +173,7 @@ Queries go through Grafana's Snowflake datasource (Grafana Enterprise plugin `gr
 
 ### Incidents
 
-- **Search, create, and update incidents:** Manage incidents in Grafana Incident, including searching, creating, and adding activities to incidents.
+- **Search, create, and update incidents:** Manage incidents in Grafana Incident, including searching, creating, adding activities, and reading or setting custom fields.
 
 ### Sift Investigations
 
@@ -210,12 +212,16 @@ Queries go through Grafana's Snowflake datasource (Grafana Enterprise plugin `gr
 - **List permissions for a resource:** List all permissions defined for a specific resource (dashboard, datasource, folder, etc.).
 - **Describe a Grafana resource:** List available permissions and assignment capabilities for a resource type.
 
+### User
+
+- **User info:** Get the current Grafana identity — login, email, name, whether it is a Grafana (server) admin, the current organization, and the organizations the credential can access (with roles). Use it to discover valid `orgId` values for [multi-organization](#multi-organization-support) requests.
+
 ### Navigation
 
 - **Generate deeplinks:** Create accurate deeplink URLs for Grafana resources instead of relying on LLM URL guessing.
   - **Dashboard links:** Generate direct links to dashboards using their UID (e.g., `http://localhost:3000/d/dashboard-uid`)
   - **Panel links:** Create links to specific panels within dashboards with viewPanel parameter (e.g., `http://localhost:3000/d/dashboard-uid?viewPanel=5`)
-  - **Explore links:** Generate links to Grafana Explore with pre-configured datasources (e.g., `http://localhost:3000/explore?left={"datasource":"prometheus-uid"}`)
+  - **Explore links:** Generate links to Grafana Explore with pre-configured datasources (e.g., `http://localhost:3000/explore?schemaVersion=1&panes={"a":{"datasource":"prometheus-uid"}}`). Grafana below 10.2 does not understand `panes`, so the legacy `?left={...}` format is emitted for those versions instead.
   - **Time range support:** Add time range parameters to links (`from=now-1h&to=now`)
   - **Custom parameters:** Include additional query parameters like dashboard variables or refresh intervals
 
@@ -226,6 +232,7 @@ Queries go through Grafana's Snowflake datasource (Grafana Enterprise plugin `gr
 - **Create Graphite Annotation:** Create annotations using Graphite format (`what`, `when`, `tags`, `data`).
 - **Update Annotation:** Replace all fields of an existing annotation (full update).
 - **Patch Annotation:** Update only specific fields of an annotation (partial update).
+- **Delete Annotation:** Permanently delete an annotation by ID.
 - **Get Annotation Tags:** List available annotation tags with optional filtering.
 
 ### Snapshots
@@ -321,6 +328,7 @@ Scopes define the specific resources that permissions apply to. Each action requ
 | `list_team_roles`                 | Admin                     | List roles for teams                                                                                         | `roles:read`                                           | `teams:id:7`                                        |
 | `get_resource_permissions`        | Admin                     | List permissions for a resource                                                                              | `permissions:read`                                     | `dashboards:uid:abcd1234`                           |
 | `get_resource_description`        | Admin                     | Describe a Grafana resource type                                                                             | `permissions:read`                                     | `dashboards:*`                                      |
+| `user_info`                       | User                      | Current identity, capabilities, and accessible organizations                                                 | None (signed-in user)                                  | —                                                   |
 | `search_dashboards`               | Search                    | Search for dashboards                                                                                        | `dashboards:read`                                      | `dashboards:*` or `dashboards:uid:abc123`           |
 | `get_dashboard_by_uid`            | Dashboard                 | Get a dashboard by uid                                                                                       | `dashboards:read`                                      | `dashboards:uid:abc123`                             |
 | `update_dashboard`                | Dashboard                 | Update or create a new dashboard                                                                             | `dashboards:create`, `dashboards:write`                | `dashboards:*`, `folders:*` or `folders:uid:xyz789` |
@@ -337,10 +345,12 @@ Scopes define the specific resources that permissions apply to. Each action requ
 | `list_prometheus_label_names`     | Prometheus                | List label names matching a selector                                                                         | `datasources:query`                                    | `datasources:uid:prometheus-uid`                    |
 | `list_prometheus_label_values`    | Prometheus                | List values for a specific label                                                                             | `datasources:query`                                    | `datasources:uid:prometheus-uid`                    |
 | `query_prometheus_histogram`      | Prometheus                | Calculate histogram percentile values                                                                        | `datasources:query`                                    | `datasources:uid:prometheus-uid`                    |
-| `list_incidents`                  | Incident                  | List incidents in Grafana Incident                                                                           | Viewer role                                            | N/A                                                 |
-| `create_incident`                 | Incident                  | Create an incident in Grafana Incident                                                                       | Editor role                                            | N/A                                                 |
+| `list_incidents`                  | Incident                  | List incidents in Grafana Incident, optionally with their custom field values                                | Viewer role                                            | N/A                                                 |
+| `create_incident`                 | Incident                  | Create an incident in Grafana Incident, optionally setting custom fields                                     | Editor role                                            | N/A                                                 |
 | `add_activity_to_incident`        | Incident                  | Add an activity item to an incident in Grafana Incident                                                      | Editor role                                            | N/A                                                 |
-| `get_incident`                    | Incident                  | Get a single incident by ID                                                                                  | Viewer role                                            | N/A                                                 |
+| `update_incident`                 | Incident                  | Update an incident in Grafana Incident (status, severity, title, or custom fields)                           | Editor role                                            | N/A                                                 |
+| `get_incident`                    | Incident                  | Get a single incident by ID, including its custom fields                                                     | Viewer role                                            | N/A                                                 |
+| `list_incident_custom_fields`     | Incident                  | List the custom fields configured for incidents, with their types and select options                         | Viewer role                                            | N/A                                                 |
 | `query_loki_logs`                 | Loki                      | Query and retrieve logs using LogQL (either log or metric queries)                                           | `datasources:query`                                    | `datasources:uid:loki-uid`                          |
 | `list_loki_label_names`           | Loki                      | List all available label names in logs                                                                       | `datasources:query`                                    | `datasources:uid:loki-uid`                          |
 | `list_loki_label_values`          | Loki                      | List values for a specific log label                                                                         | `datasources:query`                                    | `datasources:uid:loki-uid`                          |
@@ -355,6 +365,7 @@ Scopes define the specific resources that permissions apply to. Each action requ
 | `list_cloudwatch_namespaces`      | CloudWatch*               | List available AWS CloudWatch namespaces                                                                     | `datasources:query`                                    | `datasources:uid:*`                                 |
 | `list_cloudwatch_metrics`         | CloudWatch*               | List metrics in a namespace                                                                                  | `datasources:query`                                    | `datasources:uid:*`                                 |
 | `list_cloudwatch_dimensions`      | CloudWatch*               | List dimensions for a metric                                                                                 | `datasources:query`                                    | `datasources:uid:*`                                 |
+| `list_cloudwatch_dimension_values`| CloudWatch*               | List values for a dimension key                                                                              | `datasources:query`                                    | `datasources:uid:*`                                 |
 | `query_cloudwatch`                | CloudWatch*               | Execute CloudWatch metric queries                                                                            | `datasources:query`                                    | `datasources:uid:*`                                 |
 | `list_athena_catalogs`            | Athena*                   | List available Athena data catalogs                                                                          | `datasources:query`                                    | `datasources:uid:*`                                 |
 | `list_athena_databases`           | Athena*                   | List databases in an Athena catalog                                                                          | `datasources:query`                                    | `datasources:uid:*`                                 |
@@ -368,6 +379,7 @@ Scopes define the specific resources that permissions apply to. Each action requ
 | `query_snowflake`                 | Snowflake*                | Execute SQL queries with macro/variable substitution                                                         | `datasources:query`                                    | `datasources:uid:*`                                 |
 | `alerting_manage_rules`           | Alerting                  | Manage alert rules (list, get, versions, create, update, delete)                                             | `alert.rules:read` + `alert.rules:write` for mutations | `folders:*` or `folders:uid:alerts-folder`          |
 | `alerting_manage_routing`         | Alerting                  | Manage notification policies, contact points, and time intervals                                             | `alert.notifications:read`                             | Global scope                                        |
+| `alerting_manage_silences`        | Alerting                  | Manage alerting silences (list, get, create, update, expire)                                                 | `alert.instances:read` + `alert.instances:write` for mutations | Global scope                                        |
 | `list_oncall_schedules`           | OnCall                    | List schedules from Grafana OnCall                                                                           | `grafana-oncall-app.schedules:read`                    | Plugin-specific scopes                              |
 | `get_oncall_shift`                | OnCall                    | Get details for a specific OnCall shift                                                                      | `grafana-oncall-app.schedules:read`                    | Plugin-specific scopes                              |
 | `get_current_oncall_users`        | OnCall                    | Get users currently on-call for a specific schedule                                                          | `grafana-oncall-app.schedules:read`                    | Plugin-specific scopes                              |
@@ -375,6 +387,7 @@ Scopes define the specific resources that permissions apply to. Each action requ
 | `list_oncall_users`               | OnCall                    | List users from Grafana OnCall                                                                               | `grafana-oncall-app.user-settings:read`                | Plugin-specific scopes                              |
 | `list_alert_groups`               | OnCall                    | List alert groups from Grafana OnCall with filtering options                                                 | `grafana-oncall-app.alert-groups:read`                 | Plugin-specific scopes                              |
 | `get_alert_group`                 | OnCall                    | Get a specific alert group from Grafana OnCall by its ID                                                     | `grafana-oncall-app.alert-groups:read`                 | Plugin-specific scopes                              |
+| `update_alert_group`              | OnCall                    | Acknowledge, unacknowledge, resolve, or unresolve an alert group                                             | `grafana-oncall-app.alert-groups:write` (and `:read`)  | Plugin-specific scopes                              |
 | `get_sift_investigation`          | Sift                      | Retrieve an existing Sift investigation by its UUID                                                          | Viewer role                                            | N/A                                                 |
 | `get_sift_analysis`               | Sift                      | Retrieve a specific analysis from a Sift investigation                                                       | Viewer role                                            | N/A                                                 |
 | `list_sift_investigations`        | Sift                      | Retrieve a list of Sift investigations with an optional limit                                                | Viewer role                                            | N/A                                                 |
@@ -391,11 +404,14 @@ Scopes define the specific resources that permissions apply to. Each action requ
 | `agento11y_manage_evaluators` | Agent Observability*    | Manage evaluators, evaluator templates, and the judge catalog (list, get, upsert, fork, test, delete)    | `grafana-agento11y-app.data:read` + `grafana-agento11y-app.eval:write` for mutations and tests | N/A                                                 |
 | `agento11y_manage_eval_rules` | Agent Observability*    | Manage eval rules and guards (list, get, create, update, preview, delete)                               | `grafana-agento11y-app.data:read` + `grafana-agento11y-app.eval:write` for mutations and previews | N/A                                                 |
 | `agento11y_manage_eval_collections` | Agent Observability* | Manage saved conversations and the collections that group them (list, get, save, create, update, delete, add and remove members) | `grafana-agento11y-app.data:read` + `grafana-agento11y-app.eval:write` for mutations | N/A                                                 |
+| `agento11y_manage_experiments` | Agent Observability* | Read offline experiments, their trials, scores, artifact metadata, and filter facets; update and cancel an experiment | `grafana-agento11y-app.data:read` + `grafana-agento11y-app.eval:write` for mutations | N/A                                                 |
+| `agento11y_manage_test_suites` | Agent Observability* | Manage the test suites that offline experiments run against, their versions, and their test cases (list, get, create, update, draft, publish, upsert, delete) | `grafana-agento11y-app.data:read` + `grafana-agento11y-app.eval:write` for mutations | N/A                                                 |
 | `ask_assistant`                   | Assistant*                | Send a prompt to Grafana Assistant and return the full text reply (multi-turn via `contextId`)              | Plugin-specific permissions                            | Plugin-specific scopes                              |
 | `generate_deeplink`               | Navigation                | Generate accurate deeplink URLs for Grafana resources                                                        | None (read-only URL generation)                        | N/A                                                 |
 | `get_annotations`                 | Annotations               | Fetch annotations with filters                                                                               | `annotations:read`                                     | `annotations:*` or `annotations:id:123`             |
 | `create_annotation`               | Annotations               | Create a new annotation (standard or Graphite format)                                                        | `annotations:write`                                    | `annotations:*`                                     |
 | `update_annotation`               | Annotations               | Update specific fields of an annotation (partial update)                                                     | `annotations:write`                                    | `annotations:*`                                     |
+| `delete_annotation`               | Annotations               | Delete an annotation by ID                                                                                   | `annotations:delete`                                    | `annotations:*`                                     |
 | `get_annotation_tags`             | Annotations               | List annotation tags with optional filtering                                                                 | `annotations:read`                                     | `annotations:*`                                     |
 | `list_snapshots`                  | Snapshot                  | List dashboard snapshots with optional query and limit filters                                               | `dashboards:read`                                      | `dashboards:*` or `dashboards:uid:abc123`           |
 | `get_snapshot`                    | Snapshot                  | Get snapshot metadata and dashboard payload by snapshot key                                                  | `dashboards:read`                                      | `dashboards:*` or `dashboards:uid:abc123`           |
@@ -404,6 +420,8 @@ Scopes define the specific resources that permissions apply to. Each action requ
 | `get_panel_image`                 | Rendering                 | Render a stored dashboard or panel — or a provisioning preview from a repository branch — as a PNG image     | `dashboards:read`                                      | `dashboards:uid:abc123`                             |
 | `list_provisioning_repositories`  | Provisioning              | List provisioning repositories (e.g. git-sync sources) with their source URL, branch, sync state, and health | `provisioning.repositories:read`                       | N/A                                                 |
 | `validate_provisioning_file`      | Provisioning              | Dry-run-apply a file from a provisioning repository and report admission validation errors                   | `provisioning.repositories:read`                       | N/A                                                 |
+| `search_docs`                     | Docs                      | Search Grafana documentation or list product groups (omit query to list products)                            | None (public grafana.com/docs)                         | N/A                                                 |
+| `get_doc`                         | Docs                      | Fetch a documentation page; set outline_only for headings, or section for bounded retrieval                  | None (public grafana.com/docs)                         | N/A                                                 |
 
 _* Disabled by default. Add category to `--enabled-tools` to enable._
 
@@ -416,12 +434,14 @@ The `mcp-grafana` binary supports various command-line flags for configuration:
 - `--address`: The host and port for SSE/streamable-http server - default: `localhost:8000`
 - `--base-path`: Base path for the SSE/streamable-http server
 - `--endpoint-path`: Endpoint path for the streamable-http server - default: `/mcp`
+- `--server-name`: Server name used in the MCP handshake and OTel `service.name` - default: `mcp-grafana`. Overrides `GRAFANA_MCP_SERVER_NAME` env var
+- `--instructions-append`: Text appended to the server instructions returned to MCP clients on initialize, so every connecting agent sees it
 
 **HTTP Transport Security (SSE / streamable-http only):**
 
-`Host`/`Origin` validation is enforced on *every* route on the listener — `/sse`, `/mcp`, `/healthz`, and `/metrics` — so a DNS-rebinding browser cannot reach any of them. Stdio transport is unaffected.
+`Host`/`Origin` validation is enforced on *every* route on the MCP listener — `/sse`, `/mcp`, and `/healthz` / `/metrics` when they share that listener — so a DNS-rebinding browser cannot reach any of them. Stdio transport is unaffected. `--healthz-address` and `--metrics-address` start a separate listener that is not wrapped.
 
-- `--allowed-hosts`: Comma-separated allowlist of `Host` header values. Defaults to loopback variants of `--address` (e.g. `localhost:8000,127.0.0.1:8000,[::1]:8000`). A value that parses to empty (unset, `,`, ` , `, etc.) also falls back to the defaults so a typo cannot silently disable the check. Requests with a `Host` header outside the allowlist are rejected with `403`. Pass `*` to disable the check — only safe when running behind a trusted reverse proxy that rewrites `Host`, or in an isolated network. K8s `httpGet` probes and external `/metrics` scrapes will need either an explicit hostname in this list, `*`, or a `tcpSocket` probe / a separate metrics port (`--metrics-address`).
+- `--allowed-hosts`: Comma-separated allowlist of `Host` header values. Defaults to loopback variants of `--address` (e.g. `localhost:8000,127.0.0.1:8000,[::1]:8000`). A value that parses to empty (unset, `,`, ` , `, etc.) also falls back to the defaults so a typo cannot silently disable the check. Requests with a `Host` header outside the allowlist are rejected with `403`. Pass `*` to disable `Host` validation — only safe when a trusted reverse proxy validates `Host`. K8s `httpGet` probes and external `/metrics` scrapes will need either an explicit hostname in this list, `*`, a `tcpSocket` probe, or a separate port (`--healthz-address` / `--metrics-address`).
 - `--allowed-origins`: Comma-separated allowlist of `Origin` header values. Empty by default — any request that carries an `Origin` header is rejected (browsers always send one for cross-origin requests, and no browser should be calling this server directly). Set to an explicit list to permit browser-based clients, or `*` to disable the check.
 
 **Caller Authentication (SSE / streamable-http only):**
@@ -443,6 +463,7 @@ Caller authentication is enforced only when `--server-auth-token` is set. When i
 **Observability:**
 - `--metrics`: Enable Prometheus metrics endpoint at `/metrics`
 - `--metrics-address`: Separate address for metrics server (e.g., `:9090`). If empty, metrics are served on the main server
+- `--healthz-address`: Separate address for `/healthz` (e.g., `:8080`). If empty, `/healthz` is served on the main server. Shares a listener with `--metrics-address` when the two addresses match. Side listeners skip Host/Origin validation.
 - `--slow-request-threshold`: Log an event when any MCP request (tool invocation, list, resource read, etc.) takes longer than this duration. Accepts Go duration strings (e.g., `500ms`, `5s`). Default `0` disables slow-request logging. See the [Slow-request logging](#slow-request-logging) section.
 - `--slow-request-log-level`: Log level for slow-request events (`info` or `warn`) - default: `warn`.
 
@@ -452,11 +473,18 @@ Caller authentication is enforced only when `--server-auth-token` is set. When i
 **Tool Configuration:**
 - `--enabled-tools`: Comma-separated list of enabled categories - default: all categories except `admin`, `agento11y`, `assistant`, `athena`, `clickhouse`, `cloudwatch`, `elasticsearch`, `examples`, `graphite`, `quickwit`, `runpanelquery`, and `snowflake`. To enable disabled categories, add them to the list (e.g., `"search,datasource,...,snowflake"`)
 - `--max-loki-log-limit`: Maximum number of log lines returned per `query_loki_logs` call - default: `100`. Note: Set this at least 1 below Loki's server-side `max_entries_limit_per_query` to allow truncation detection (the tool requests `limit+1` internally to detect if more data exists).
+- `--loki-guardrail-mode`: Loki query cost guardrail for `query_loki_logs` - default: `off`. Loki does not enforce `max_query_bytes_read` on log queries without a line filter, so a broad selector over a wide range can scan terabytes; the guardrail requires a selective stream selector, caps the effective time range (including range-vector durations like `[30d]`), and pre-checks Loki's index/stats byte estimate before running the query. `shadow` logs queries that would be blocked but lets them run (it still pays the index/stats round trip); `enforce` rejects them with rewrite guidance the LLM can act on. On VictoriaLogs the guardrail applies only to selector-shaped (`{...}`) queries — when no selector parses (the normal brace-less LogsQL shape), the query passes through entirely, and the byte-budget check never applies (no cheap index estimate). Env fallback: `GRAFANA_LOKI_GUARDRAIL_MODE`.
+- `--loki-guardrail-max-bytes`: Maximum bytes a single `query_loki_logs` call may scan, estimated via Loki's index/stats API - default: `107374182400` (100 GiB). `0` disables the byte-budget check. Env fallback: `GRAFANA_LOKI_GUARDRAIL_MAX_BYTES`.
+- `--loki-guardrail-max-range`: Maximum effective time range for a single `query_loki_logs` call, including range-vector durations - default: `24h`. Accepts Go duration strings. `0` disables the range check. Env fallback: `GRAFANA_LOKI_GUARDRAIL_MAX_RANGE`.
+- `--loki-enforced-matchers`: LogQL label matchers AND-ed into every native-Loki query to restrict which log streams can be read (e.g. `environment=~"prod|staging"`). Requires `--disable-api`. See [Loki query enforcement](#loki-query-enforcement).
+- `--loki-label-enumeration-fallback`: What the label-enumeration tools do when negative enforced matchers can't scope them: `reject` (default) or `unfiltered`. See [Loki query enforcement](#loki-query-enforcement).
 - `--disable-search`: Disable search tools
 - `--disable-datasource`: Disable datasource tools
 - `--disable-incident`: Disable incident tools
 - `--disable-prometheus`: Disable prometheus tools
 - `--disable-write`: Disable write tools (create/update operations)
+- `--disable-query`: Disable query tools (tools that execute a query against a datasource); metadata and discovery tools stay available
+- `--enable-query`: Keep the raw-SQL query tools (`query_clickhouse`, `query_snowflake`, `query_athena`, `query_influxdb`) registered even under `--disable-write`
 - `--disable-loki`: Disable loki tools
 - `--disable-elasticsearch`: Disable elasticsearch and opensearch tools
 - `--disable-quickwit`: Disable quickwit tools
@@ -481,6 +509,7 @@ Caller authentication is enforced only when `--server-auth-token` is set. When i
 - `--disable-provisioning`: Disable provisioning tools
 - `--disable-agento11y`: Disable Agent Observability tools
 - `--disable-assistant`: Disable Grafana Assistant tools
+- `--disable-docs`: Disable documentation tools
 
 ### Read-Only Mode
 
@@ -502,13 +531,19 @@ When `--disable-write` is enabled, the following write operations are disabled:
 **Incident Tools:**
 - `create_incident`
 - `add_activity_to_incident`
+- `update_incident`
 
 **Alerting Tools:**
 - `alerting_manage_rules` (create, update, delete operations)
+- `alerting_manage_silences` (create, update, delete operations)
+
+**OnCall Tools:**
+- `update_alert_group`
 
 **Annotation Tools:**
 - `create_annotation`
 - `update_annotation`
+- `delete_annotation`
 
 **Sift Tools:**
 - `find_error_pattern_logs` (creates investigations)
@@ -518,12 +553,78 @@ When `--disable-write` is enabled, the following write operations are disabled:
 - `create_snapshot`
 - `delete_snapshot`
 
+**Raw-SQL Query Tools:**
+
+These execute whatever query you give them without inspecting it, so they can write when the datasource credentials permit it — `query_clickhouse` will run a `DROP TABLE`, `query_influxdb` will run a `DELETE`. Read-only mode therefore removes them. Pass `--enable-query` to keep them when the datasource credentials are known to be read-only.
+
+- `query_clickhouse`
+- `query_snowflake`
+- `query_athena`
+- `query_influxdb`
+
 **Agent Observability Tools:**
 - `agento11y_manage_evaluators` (upsert, delete, fork, test evaluator operations)
 - `agento11y_manage_eval_rules` (create, update, delete, preview rule and guard operations)
 - `agento11y_manage_eval_collections` (save and delete saved conversations; create, update, delete collections; add and remove collection members)
+- `agento11y_manage_experiments` (update and cancel experiment operations)
+- `agento11y_manage_test_suites` (create and update test suites; create and publish versions; upsert and delete test cases)
 
-All read operations remain available, allowing you to query dashboards, run PromQL/LogQL queries, list resources, and retrieve data.
+All read operations remain available, allowing you to query dashboards, run PromQL/LogQL queries, list resources, and retrieve data. The query languages that cannot express a write — PromQL, LogQL, TraceQL, the Elasticsearch DSL, Graphite, CloudWatch — keep their query tools in read-only mode; only the raw-SQL ones listed above are removed.
+
+### Query-Free Mode
+
+The `--disable-query` flag removes every tool that executes a query against a datasource, while leaving the metadata and discovery tools in place. This is useful when you want an assistant that can explore what exists — datasources, dashboards, metric names, labels, table schemas — without running potentially expensive or data-revealing queries, for example when the service account has `datasources:read` but not `datasources:query`.
+
+It is the strongest of the three query settings, and it wins over `--enable-query`:
+
+| Flags | Safe query tools (`query_prometheus`, `query_loki_logs`, `run_panel_query`, …) | Raw-SQL query tools (`query_clickhouse`, `query_snowflake`, `query_athena`, `query_influxdb`) |
+| --- | --- | --- |
+| _(none)_ | registered | registered |
+| `--disable-write` | registered | **not registered** |
+| `--disable-write --enable-query` | registered | registered |
+| `--disable-query` | not registered | not registered |
+| `--disable-query --enable-query` | not registered | not registered |
+
+When `--disable-query` is enabled, the following tools are not registered:
+
+**Prometheus Tools:**
+- `query_prometheus`
+- `query_prometheus_histogram`
+
+**Loki Tools:**
+- `query_loki_logs`
+- `query_loki_patterns`
+
+`query_loki_stats` and `analyze_loki_labels` stay registered: both send a selector to the datasource, but they read the index and return stream, chunk, and byte counts rather than log content.
+
+**Elasticsearch/OpenSearch and Quickwit Tools:**
+- `query_elasticsearch`
+- `query_quickwit`
+
+**InfluxDB Tools** (also removed by `--disable-write`, see above)**:**
+- `query_influxdb`
+
+**SQL Datasource Tools** (also removed by `--disable-write`, see above)**:**
+- `query_clickhouse`
+- `query_snowflake`
+- `query_athena`
+
+**Graphite Tools:**
+- `query_graphite`
+- `query_graphite_density`
+
+**CloudWatch Tools:**
+- `query_cloudwatch`
+
+**Pyroscope Tools:**
+- `query_pyroscope`
+
+**Run Panel Query Tools:**
+- `run_panel_query`
+
+The `elasticsearch`, `quickwit`, `influxdb`, and `runpanelquery` categories contain nothing else, so they register no tools at all when queries are disabled. The sibling tools in every other category — `list_prometheus_metric_names`, `list_loki_label_values`, `describe_clickhouse_table`, `list_cloudwatch_metrics`, and so on — remain available.
+
+Note that `--disable-query` gates the query tools and the `grafana_api_request` POST-to-`/api/ds/query` path, but does not police every route to a datasource. In read-only mode, `grafana_api_request` allows POST to `/api/ds/query` only when query tools are enabled (same gate as the raw-SQL tools — blocked by `--disable-write` unless `--enable-query` overrides). `get_panel_image`, which renders a panel server-side, is unaffected.
 
 **Client TLS Configuration (for Grafana connections):**
 - `--tls-cert-file`: Path to TLS certificate file for client authentication
@@ -577,6 +678,14 @@ You can specify which organization to interact with using either:
 
 When an organization ID is provided, the MCP server will set the `X-Grafana-Org-Id` header on all requests to Grafana, ensuring that operations are performed within the specified organization context.
 
+#### Dynamic (per-call) organization selection
+
+The options above fix the organization for the whole connection. To let a single connection target different organizations per tool call, start the server with the `--dynamic-multi-org` flag. This is off by default.
+
+When enabled, every tool accepts an optional `orgId` argument that overrides the connection's organization for that call (driving both the `X-Grafana-Org-Id` header and, for app-platform APIs, the resolved Kubernetes namespace). Proxied datasource tools are additionally discovered across every organization the credential can access. Calls that omit `orgId` use the connection's default organization.
+
+This only works for credentials that belong to more than one organization (e.g. a user or on-behalf-of identity); a service-account token remains bound to its single organization. Use the [`user_info`](#user) tool to discover which `orgId` values are valid.
+
 **Example with organization ID:**
 
 ```json
@@ -618,6 +727,32 @@ You can add arbitrary HTTP headers to all Grafana API requests using the `GRAFAN
 }
 ```
 
+### SOCKS5 Proxy
+
+You can route all requests this server makes to Grafana through a SOCKS5 proxy using the `GRAFANA_SOCKS5_PROXY` environment variable. The proxy is scoped to this server's Grafana traffic: it does not modify the global `HTTP_PROXY`/`HTTPS_PROXY` variables, and when set it overrides their proxy selection for Grafana transports only, without affecting other MCP servers or your shell session. When unset, behavior is unchanged.
+
+The URL must use the `socks5://` or `socks5h://` scheme (Go treats them identically: hostname resolution is delegated to the proxy) and may include credentials, e.g. `socks5://user:pass@127.0.0.1:1080`.
+
+**Example:**
+
+```json
+{
+  "mcpServers": {
+    "grafana": {
+      "command": "mcp-grafana",
+      "args": [],
+      "env": {
+        "GRAFANA_URL": "http://localhost:3000",
+        "GRAFANA_SERVICE_ACCOUNT_TOKEN": "<your token>",
+        "GRAFANA_SOCKS5_PROXY": "socks5://127.0.0.1:1080"
+      }
+    }
+  }
+}
+```
+
+An invalid proxy URL is a startup error, and if building a proxied connection fails at runtime the server fails closed rather than silently sending Grafana traffic directly.
+
 ### Forwarding Headers from the Client (SSE/Streamable-HTTP Only)
 
 When the MCP server runs behind a gateway or reverse proxy that handles SSO (e.g. an AWS ALB with OIDC), each user's session cookie must reach Grafana so it can associate the request with the authenticated user. The `GRAFANA_FORWARD_HEADERS` environment variable enables this by specifying a comma-separated allowlist of header names to copy from the **incoming** HTTP request to every outbound Grafana API request.
@@ -643,6 +778,8 @@ GRAFANA_FORWARD_HEADERS=Cookie,X-Session-Id
 ```
 
 Forwarded headers are merged with any headers defined in `GRAFANA_EXTRA_HEADERS`. If a header name appears in both, the value from the incoming request takes precedence for that request.
+
+Trace context headers (`traceparent`, `tracestate`, `baggage`) are the exception: the server propagates trace context itself, so a forwarded value never overrides the one it injects. See [observability](docs/sources/developer/observability-metrics-and-tracing.md#trace-context-propagation).
 
 2. You have several options to install `mcp-grafana`:
 
@@ -1074,8 +1211,9 @@ When using the SSE (`-t sse`) or streamable HTTP (`-t streamable-http`) transpor
 # For streamable HTTP or SSE transport on default port
 curl http://localhost:8000/healthz
 
-# With custom address
-curl http://localhost:9090/healthz
+# Probe a side listener while MCP stays on loopback (Kubernetes + sidecar)
+./mcp-grafana -t streamable-http --address 127.0.0.1:8000 --healthz-address :8080
+curl http://127.0.0.1:8080/healthz
 ```
 
 **Note:** The health check endpoint is only available when using SSE or streamable HTTP transports. It is not available when using the stdio transport (`-t stdio`), as stdio does not expose an HTTP server.
@@ -1107,6 +1245,19 @@ When using the SSE or streamable HTTP transports, enable Prometheus metrics with
 | `http_server_request_duration_seconds` | Histogram | Duration of HTTP server requests (from otelhttp) |
 
 **Note:** Metrics are only available when using SSE or streamable HTTP transports. They are not available with the stdio transport.
+
+When the [Loki cost guardrail](#cli-flags-reference) (`--loki-guardrail-mode`) is enabled, four more counters record its decisions:
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `mcp_loki_guardrail_admitted_total` | Counter | Queries that passed every enabled check (labels: `backend`) |
+| `mcp_loki_guardrail_would_block_total` | Counter | Queries that failed a check in `shadow` mode and ran anyway (labels: `backend`, `reason`) |
+| `mcp_loki_guardrail_blocked_total` | Counter | Queries rejected in `enforce` mode (labels: `backend`, `reason`) |
+| `mcp_loki_guardrail_fail_open_total` | Counter | Queries the guardrail could not evaluate and admitted (labels: `backend`, `cause`) |
+
+`reason` is one of `selector`, `range`, `bytes`; `cause` is one of `unparseable`, `estimate_failed`; `backend` is one of `loki`, `victorialogs`, `unknown`. A query that trips several checks is counted once, labelled with the check that ran first (`selector`, then `range`, then `bytes`), so the four counters partition the guarded population. See [Observability](docs/sources/developer/observability-metrics-and-tracing.md#loki-cost-guardrail-metrics) for how to read them during a `shadow` → `enforce` rollout.
+
+Library embedders should set `GrafanaConfig.MeterProvider` (the metrics counterpart of `GrafanaConfig.Logger`): the guardrail runs inside a tool handler, so it has no constructor option, and a process that installs a noop global `MeterProvider` would otherwise drop every recording.
 
 #### Slow-request logging
 
@@ -1197,6 +1348,60 @@ docker run --rm -p 8000:8000 \
   -t streamable-http --metrics
 ```
 
+## Loki query enforcement
+
+`--loki-enforced-matchers` lets an operator restrict which Loki log streams the
+server can ever read, by AND-ing a fixed set of LogQL label matchers into every
+native-Loki query the server issues. This is useful when a datasource contains
+streams that must not be exposed (e.g. logs that may carry sensitive
+information) but you cannot restrict access at the Grafana or Loki layer (OSS has
+no per-datasource or per-user label access control).
+
+```bash
+# Only ever read prod/staging environments (allowlist)
+./mcp-grafana --loki-enforced-matchers 'environment=~"prod|staging"' --disable-api
+
+# Never read the vault or payments namespaces (exclusion)
+./mcp-grafana --loki-enforced-matchers 'namespace!~"vault|payments"' --disable-api
+```
+
+How it works:
+
+- The matchers are parsed once at startup (invalid input aborts the server) and
+  appended to every stream selector in each query. Because Loki AND-s matchers
+  within a selector, a user query can only ever **narrow** results within the
+  enforced bounds — it can never widen them. A user selector that conflicts with
+  the policy (e.g. asking for `{namespace="vault"}` under an exclusion) simply
+  returns nothing.
+- It covers `query_loki_logs`, `query_loki_stats`, `query_loki_patterns`,
+  `list_loki_label_names`, and `list_loki_label_values`.
+- It **fails closed**: any query that cannot be parsed is rejected rather than
+  sent unfiltered.
+- **VictoriaLogs** datasources use LogsQL, which cannot be safely rewritten, so
+  they are refused entirely while enforcement is enabled.
+- Purely-negative matchers cannot scope the label-enumeration endpoints (Loki
+  rejects a standalone selector with no positive matcher). Control that edge case
+  with `--loki-label-enumeration-fallback` (`reject` by default, or `unfiltered`
+  to allow unscoped enumeration of label *metadata* — log lines are never
+  exposed). Positive/allowlist matchers are not affected.
+
+> [!IMPORTANT]
+> Enforcement only applies to the Loki query tools. Other tools can reach Loki log
+> data through paths that never touch the enforced backend, so for the restriction
+> to actually hold you must also disable them:
+>
+> - `--disable-api` — `grafana_api_request` can query the Loki datasource proxy directly (full bypass).
+> - `--disable-rendering` — `get_panel_image` renders Loki panels server-side, producing images with unrestricted log lines.
+> - `--disable-sift` — Sift investigations analyze Loki logs server-side across all streams.
+> - `--disable-assistant` — `ask_assistant` delegates to Grafana Assistant, which reads Loki server-side across all streams. Only registered when write tools are enabled, so `--disable-write` closes it too.
+>
+> The server logs a warning at startup naming each of these that is still enabled.
+> `run_panel_query` is safe (it reuses the enforced query path). Proxied tools
+> currently expose only Tempo (traces), not Loki logs, so they are not a bypass
+> today — but disable them (`--disable-proxied`) if that ever changes. Dashboard
+> snapshots (`--disable-snapshot`) can also embed log-panel data captured outside
+> enforcement.
+
 ## Troubleshooting
 
 ### Grafana Version Compatibility
@@ -1213,7 +1418,9 @@ This typically indicates that you are using a Grafana version earlier than 9.0. 
 
 ## Development
 
-Contributions are welcome! Please open an issue or submit a pull request if you have any suggestions or improvements.
+Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) first — it covers what belongs in this server and how to propose it.
+
+If you're **adding a new tool**, please [open a tool proposal](https://github.com/grafana/mcp-grafana/issues/new?template=new-tool-proposal.yml) before writing the code. Every default-on tool is sent to the model on every request by every user, so we'd rather discuss the idea than decline a finished pull request. Bug fixes, docs, tests and new parameters on existing tools need no proposal — just send a PR.
 
 This project is written in Go. Install Go following the instructions for your platform.
 

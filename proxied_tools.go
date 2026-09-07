@@ -6,10 +6,15 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -21,7 +26,92 @@ const (
 	// mcpProbeTimeout is the timeout for probing a single datasource's MCP endpoint.
 	// This is kept short to avoid slow startup when datasources are unreachable.
 	mcpProbeTimeout = 5 * time.Second
+
+	// defaultSessionAttachWaitBudget bounds how long a single hook invocation
+	// (OnBeforeListTools / OnBeforeCallTool) waits for a shared proxiedToolSet
+	// build before giving up for this call. The build itself is NOT bounded by
+	// this and keeps running in the background (see runProxiedToolSetBuild's use
+	// of context.WithoutCancel): a build with several candidates, each retried
+	// on transient failures, can take tens of seconds, and blocking a request
+	// for that long risks losing a race against the caller's own timeout or the
+	// session being torn down before tools can be registered on it. Giving up
+	// after a short, fixed budget keeps that race window small; the session's
+	// next hook invocation retries the (by then very likely already published)
+	// attach for free. Chosen short enough to stay well under realistic client/
+	// infra timeouts, long enough that a build with zero or one retried
+	// candidate still normally completes within it. Held on ToolManager as
+	// sessionAttachWaitBudget (defaulting to this) so tests can shorten it.
+	defaultSessionAttachWaitBudget = 3 * time.Second
+
+	// proxiedToolsMeterName is the OTel meter name for discovery/connect metrics,
+	// matching the convention used by clientCacheMeterName/sessionMeterName.
+	proxiedToolsMeterName = "mcp-grafana"
 )
+
+// discoveryMetrics holds OTel instruments for MCP datasource discovery (probe)
+// and connection (buildProxiedToolSet) observability.
+type discoveryMetrics struct {
+	probeSuccess              metric.Int64Counter // Probes that found a datasource is MCP-enabled
+	probeDeterministicFailure metric.Int64Counter // Probes with a clean non-retryable response (e.g. 404): not MCP-enabled
+	probeTransientFailure     metric.Int64Counter // Probes that exhausted retries on a transient error (timeout/network/5xx)
+	probeRetries              metric.Int64Counter // Probe attempts issued as a retry (attempts beyond the first)
+
+	connectSuccess              metric.Int64Counter // Proxied client connections established
+	connectDeterministicFailure metric.Int64Counter // Connections that failed for a non-retryable reason (e.g. auth)
+	connectTransientFailure     metric.Int64Counter // Connections that exhausted retries on a transient error
+	connectRetries              metric.Int64Counter // Connect attempts issued as a retry (attempts beyond the first)
+}
+
+func newDiscoveryMetrics(mp metric.MeterProvider) discoveryMetrics {
+	if mp == nil {
+		mp = otel.GetMeterProvider()
+	}
+	meter := mp.Meter(proxiedToolsMeterName)
+
+	probeSuccess, _ := meter.Int64Counter("mcp.discovery.probe_success",
+		metric.WithDescription("Number of MCP-support probes that found a datasource is MCP-enabled"),
+		metric.WithUnit("{probe}"),
+	)
+	probeDeterministicFailure, _ := meter.Int64Counter("mcp.discovery.probe_deterministic_failure",
+		metric.WithDescription("Number of MCP-support probes that got a clean non-retryable response (e.g. 404)"),
+		metric.WithUnit("{probe}"),
+	)
+	probeTransientFailure, _ := meter.Int64Counter("mcp.discovery.probe_transient_failure",
+		metric.WithDescription("Number of MCP-support probes that exhausted retries on a transient error"),
+		metric.WithUnit("{probe}"),
+	)
+	probeRetries, _ := meter.Int64Counter("mcp.discovery.probe_retries",
+		metric.WithDescription("Number of MCP-support probe attempts issued as a retry"),
+		metric.WithUnit("{attempt}"),
+	)
+	connectSuccess, _ := meter.Int64Counter("mcp.discovery.connect_success",
+		metric.WithDescription("Number of proxied MCP client connections established"),
+		metric.WithUnit("{connection}"),
+	)
+	connectDeterministicFailure, _ := meter.Int64Counter("mcp.discovery.connect_deterministic_failure",
+		metric.WithDescription("Number of proxied MCP client connections that failed for a non-retryable reason"),
+		metric.WithUnit("{connection}"),
+	)
+	connectTransientFailure, _ := meter.Int64Counter("mcp.discovery.connect_transient_failure",
+		metric.WithDescription("Number of proxied MCP client connections that exhausted retries on a transient error"),
+		metric.WithUnit("{connection}"),
+	)
+	connectRetries, _ := meter.Int64Counter("mcp.discovery.connect_retries",
+		metric.WithDescription("Number of proxied MCP client connect attempts issued as a retry"),
+		metric.WithUnit("{attempt}"),
+	)
+
+	return discoveryMetrics{
+		probeSuccess:                probeSuccess,
+		probeDeterministicFailure:   probeDeterministicFailure,
+		probeTransientFailure:       probeTransientFailure,
+		probeRetries:                probeRetries,
+		connectSuccess:              connectSuccess,
+		connectDeterministicFailure: connectDeterministicFailure,
+		connectTransientFailure:     connectTransientFailure,
+		connectRetries:              connectRetries,
+	}
+}
 
 // MCPDatasourceConfig defines configuration for a datasource type that supports MCP
 type MCPDatasourceConfig struct {
@@ -41,14 +131,128 @@ type DiscoveredDatasource struct {
 	Name   string
 	Type   string
 	MCPURL string // The MCP endpoint URL
+	OrgID  int64  // The Grafana org the datasource was discovered in
 }
 
-// discoverMCPDatasources discovers datasources that support MCP
-// Returns a list of datasources with MCP endpoints
-func discoverMCPDatasources(ctx context.Context, logger *slog.Logger) ([]DiscoveredDatasource, error) {
+// proxiedClientKey is the map key for a proxied client, scoped by org so the
+// same datasource UID in different orgs maps to distinct clients.
+func proxiedClientKey(orgID int64, datasourceType, datasourceUID string) string {
+	return fmt.Sprintf("%d|%s|%s", orgID, datasourceType, datasourceUID)
+}
+
+// accessibleOrgIDs returns the orgs to discover proxied datasources in, and the
+// connection org (the org a call targets when it omits orgId).
+//
+// With dynamic multi-org off it returns just the connection org (current
+// behavior). With it on it returns every org the user belongs to
+// (GET /api/user/orgs), always including the connection org; for credentials
+// that can't enumerate orgs (e.g. service-account tokens, which are single-org)
+// it falls back to the connection org.
+func accessibleOrgIDs(ctx context.Context, logger *slog.Logger) (orgs []int64, connectionOrg int64) {
+	connectionOrg = resolveConnectionOrgID(ctx, logger)
+	if !DynamicMultiOrgEnabled {
+		return []int64{connectionOrg}, connectionOrg
+	}
+	userOrgs, err := ListUserOrgs(ctx)
+	if err != nil || len(userOrgs) == 0 {
+		logger.DebugContext(ctx, "could not enumerate user orgs for proxied discovery; using connection org", "error", err)
+		return []int64{connectionOrg}, connectionOrg
+	}
+	ids := make([]int64, 0, len(userOrgs))
+	for _, o := range userOrgs {
+		if o.OrgID > 0 {
+			ids = append(ids, o.OrgID)
+		}
+	}
+	if len(ids) == 0 {
+		return []int64{connectionOrg}, connectionOrg
+	}
+	if connectionOrg <= 0 {
+		// /api/org was unavailable and no org is configured, so a call that omits
+		// orgId lands on the identity's own org. Ask for that directly: leaving it
+		// at 0 would both discover the same datasources a second time under a
+		// placeholder key (0 scopes no request, so it sees the identity's own org
+		// again) and leave connectionOrgID at 0, which no discovered client is
+		// keyed by.
+		if persisted, err := UserPersistedOrgID(ctx); err == nil && persisted > 0 {
+			connectionOrg = persisted
+		} else {
+			logger.DebugContext(ctx, "could not resolve the connection org; a call omitting orgId has no org to target", "error", err)
+		}
+	}
+	// Only a real org is worth discovering, and appending a non-positive one would
+	// duplicate the identity's own org under a placeholder key.
+	if connectionOrg > 0 && !slices.Contains(ids, connectionOrg) {
+		ids = append(ids, connectionOrg)
+	}
+	return ids, connectionOrg
+}
+
+// discoverMCPDatasources discovers MCP-capable datasources across every org the
+// credential can access (just the connection org when dynamic multi-org is off),
+// returning the union tagged with the org each was found in, the total number of
+// candidates considered, and the connection org a call targets when it omits
+// orgId. Per-org discovery runs in parallel.
+//
+// An error is reported only when every org failed: the caller treats an error as
+// transient (the set is dropped from the cache and rebuilt) and a nil error as a
+// stable result, so a total failure must not look like "found nothing", and one
+// unreachable org must not discard the orgs that did resolve.
+func discoverMCPDatasources(ctx context.Context, logger *slog.Logger, metrics discoveryMetrics) ([]DiscoveredDatasource, int, int64, error) {
+	orgs, connectionOrg := accessibleOrgIDs(ctx, logger)
+
+	perOrg := make([][]DiscoveredDatasource, len(orgs))
+	candidates := make([]int, len(orgs))
+	errs := make([]error, len(orgs))
+	var wg sync.WaitGroup
+	for i, org := range orgs {
+		wg.Add(1)
+		go func(i int, org int64) {
+			defer wg.Done()
+			perOrg[i], candidates[i], errs[i] = discoverMCPDatasourcesForOrg(ctx, org, logger, metrics)
+		}(i, org)
+	}
+	wg.Wait()
+
+	var firstErr error
+	failed, totalCandidates := 0, 0
+	for i, err := range errs {
+		totalCandidates += candidates[i]
+		if err == nil {
+			continue
+		}
+		failed++
+		if firstErr == nil {
+			firstErr = err
+		}
+		logger.DebugContext(ctx, "MCP datasource discovery failed for org", "org", orgs[i], "error", err)
+	}
+	if failed == len(orgs) {
+		return nil, 0, connectionOrg, firstErr
+	}
+
+	var discovered []DiscoveredDatasource
+	for _, found := range perOrg {
+		discovered = append(discovered, found...)
+	}
+	return discovered, totalCandidates, connectionOrg, nil
+}
+
+// discoverMCPDatasourcesForOrg discovers datasources that support MCP within a
+// single org. It scopes the request to orgID so the datasource list and the MCP
+// probes carry X-Grafana-Org-Id: orgID (OrgIDRoundTripper reads the org from the
+// request context), and tags each result with the org.
+// Returns the list of datasources with MCP endpoints and the number of
+// candidates considered (datasources of an MCP-enabled type, before probing).
+func discoverMCPDatasourcesForOrg(ctx context.Context, orgID int64, logger *slog.Logger, metrics discoveryMetrics) ([]DiscoveredDatasource, int, error) {
+	if orgID > 0 {
+		cfg := GrafanaConfigFromContext(ctx)
+		cfg.OrgID = orgID
+		ctx = WithGrafanaConfig(ctx, cfg)
+	}
 	gc := GrafanaClientFromContext(ctx)
 	if gc == nil {
-		return nil, fmt.Errorf("grafana client not found in context")
+		return nil, 0, fmt.Errorf("grafana client not found in context")
 	}
 
 	var discovered []DiscoveredDatasource
@@ -58,13 +262,13 @@ func discoverMCPDatasources(ctx context.Context, logger *slog.Logger) ([]Discove
 		datasources.NewGetDataSourcesParamsWithContext(ctx),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to list datasources: %w", err)
+		return nil, 0, fmt.Errorf("failed to list datasources: %w", err)
 	}
 
 	// Get the Grafana base URL from context
 	config := GrafanaConfigFromContext(ctx)
 	if config.URL == "" {
-		return nil, fmt.Errorf("grafana url not found in context")
+		return nil, 0, fmt.Errorf("grafana url not found in context")
 	}
 	grafanaBaseURL := config.URL
 
@@ -92,12 +296,12 @@ func discoverMCPDatasources(ctx context.Context, logger *slog.Logger) ([]Discove
 
 	if len(candidates) == 0 {
 		logger.DebugContext(ctx, "no candidate MCP datasources found")
-		return nil, nil
+		return nil, 0, nil
 	}
 
 	transport, err := BuildTransport(&config, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create transport: %w", err)
+		return nil, len(candidates), fmt.Errorf("failed to create transport: %w", err)
 	}
 
 	httpClient := &http.Client{
@@ -105,7 +309,7 @@ func discoverMCPDatasources(ctx context.Context, logger *slog.Logger) ([]Discove
 		Timeout:   mcpProbeTimeout,
 	}
 
-	// Probe candidates in parallel with timeout
+	// Probe candidates in parallel, retrying transient failures.
 	type probeResult struct {
 		ds      DiscoveredDatasource
 		enabled bool
@@ -119,43 +323,76 @@ func discoverMCPDatasources(ctx context.Context, logger *slog.Logger) ([]Discove
 			defer wg.Done()
 
 			probeURL := fmt.Sprintf("%s/api/datasources/proxy/uid/%s%s", grafanaBaseURL, c.uid, c.dsConfig.EndpointPath)
+			typeAttr := metric.WithAttributes(attribute.String("datasource.type", c.dsType))
 
-			probeCtx, cancel := context.WithTimeoutCause(ctx, mcpProbeTimeout,
-				fmt.Errorf("timed out after %s probing MCP endpoint for datasource %s (%s) at %s", mcpProbeTimeout, c.name, c.uid, probeURL))
-			defer cancel()
+			doProbe := func(attemptNum int) (struct{}, error) {
+				if attemptNum > 1 {
+					metrics.probeRetries.Add(ctx, 1, typeAttr)
+				}
 
-			// Check if the datasource instance has MCP enabled
-			// We use a DELETE request to probe the MCP endpoint since:
-			// - GET would start an event stream and hang
-			// - POST doesn't work with the Grafana OpenAPI client
-			// - DELETE returns 200 if MCP is enabled, 404 if not
-			req, err := http.NewRequestWithContext(probeCtx, http.MethodDelete, probeURL, nil)
-			if err != nil {
-				logger.DebugContext(ctx, "failed to create probe request", "datasource", c.uid, "error", err)
-				return
+				probeCtx, cancel := context.WithTimeoutCause(ctx, mcpProbeTimeout,
+					fmt.Errorf("timed out after %s probing MCP endpoint for datasource %s (%s) at %s (attempt %d/%d)",
+						mcpProbeTimeout, c.name, c.uid, probeURL, attemptNum, mcpRetryMaxAttempts))
+				defer cancel()
+
+				// Check if the datasource instance has MCP enabled
+				// We use a DELETE request to probe the MCP endpoint since:
+				// - GET would start an event stream and hang
+				// - POST doesn't work with the Grafana OpenAPI client
+				// - DELETE returns 200 if MCP is enabled, 404 if not
+				req, err := http.NewRequestWithContext(probeCtx, http.MethodDelete, probeURL, nil)
+				if err != nil {
+					return struct{}{}, fmt.Errorf("failed to create probe request: %w", err)
+				}
+
+				resp, err := httpClient.Do(req)
+				if err != nil {
+					return struct{}{}, newTransientError(contextCauseOrErr(probeCtx, err))
+				}
+				defer func() { _ = resp.Body.Close() }()
+
+				switch {
+				case resp.StatusCode == http.StatusOK:
+					return struct{}{}, nil
+				case resp.StatusCode >= 500:
+					return struct{}{}, newTransientError(fmt.Errorf("probe returned server error status %d", resp.StatusCode))
+				default:
+					return struct{}{}, fmt.Errorf("probe returned non-OK status %d", resp.StatusCode)
+				}
 			}
 
-			resp, err := httpClient.Do(req)
-			if err != nil {
-				logger.DebugContext(ctx, "MCP probe failed", "datasource", c.uid, "error", contextCauseOrErr(probeCtx, err))
-				return
-			}
-			defer func() { _ = resp.Body.Close() }()
+			_, probeErr := withRetry(ctx, defaultRetryPolicy,
+				fmt.Sprintf("MCP probe for datasource %s (%s)", c.name, c.uid), doProbe)
 
-			// MCP is enabled if we get a 200 response
-			if resp.StatusCode == http.StatusOK {
-				mcpURL := fmt.Sprintf("%s/api/datasources/proxy/uid/%s%s", grafanaBaseURL, c.uid, c.dsConfig.EndpointPath)
+			switch {
+			case probeErr == nil:
+				metrics.probeSuccess.Add(ctx, 1, typeAttr)
 				results <- probeResult{
 					ds: DiscoveredDatasource{
 						UID:    c.uid,
 						Name:   c.name,
 						Type:   c.dsType,
-						MCPURL: mcpURL,
+						MCPURL: probeURL,
+						OrgID:  orgID,
 					},
 					enabled: true,
 				}
-			} else {
-				logger.DebugContext(ctx, "MCP probe returned non-OK status", "datasource", c.uid, "status", resp.StatusCode, "url", probeURL)
+			case isTransient(probeErr):
+				metrics.probeTransientFailure.Add(ctx, 1, typeAttr)
+				logger.WarnContext(ctx, "MCP probe failed after retries; excluding datasource from proxied tool set",
+					"datasource", c.uid, "name", c.name, "type", c.dsType, "error", probeErr)
+				results <- probeResult{}
+			default:
+				// A clean non-OK response (typically 404) just means this
+				// datasource instance doesn't have MCP enabled, which is a
+				// routine, expected outcome for many Tempo datasources, not a
+				// failure. Debug (not Warn) keeps that from drowning out the
+				// transient case above, which is the one worth an operator's
+				// attention.
+				metrics.probeDeterministicFailure.Add(ctx, 1, typeAttr)
+				logger.DebugContext(ctx, "MCP probe determined datasource does not support MCP; excluding it",
+					"datasource", c.uid, "name", c.name, "type", c.dsType, "error", probeErr)
+				results <- probeResult{}
 			}
 		}(c)
 	}
@@ -174,7 +411,7 @@ func discoverMCPDatasources(ctx context.Context, logger *slog.Logger) ([]Discove
 	}
 
 	logger.DebugContext(ctx, "discovered MCP datasources", "count", len(discovered), "candidates", len(candidates))
-	return discovered, nil
+	return discovered, len(candidates), nil
 }
 
 // addDatasourceUidParameter adds a required datasourceUid parameter to a tool's input schema
@@ -195,6 +432,19 @@ func addDatasourceUidParameter(tool mcp.Tool, datasourceType string) mcp.Tool {
 
 	// Add to required fields
 	modifiedTool.InputSchema.Required = append(modifiedTool.InputSchema.Required, "datasourceUid")
+
+	// When dynamic multi-org is enabled, advertise the optional orgId so the
+	// datasourceUid can be resolved in a non-default org. Proxied tools are
+	// registered directly rather than through Tool.Register, so the native
+	// injector never sees them and the property is added here instead.
+	// OrgIDOverrideMiddleware reads it into the request context and strips it, so
+	// it is never forwarded to the upstream datasource MCP server.
+	if DynamicMultiOrgEnabled {
+		modifiedTool.InputSchema.Properties[OrgIDArgument] = map[string]any{
+			"type":        "integer",
+			"description": orgIDArgumentDescription,
+		}
+	}
 
 	return modifiedTool
 }
@@ -227,25 +477,28 @@ func parseProxiedToolName(toolName string) (string, string, error) {
 //     and are sent on every request; a serialized, unambiguous form is used
 //     because a map is neither comparable nor usable as a struct field of a map
 //     key.
+//   - socks5ProxyURL: the proxy is baked into the built transport, and the URL
+//     may carry proxy credentials.
 //
 // GrafanaConfig.BaseTransport is intentionally NOT part of the key: it is an
 // http.RoundTripper (an interface value that is not reliably comparable) and is
 // process-constant (set once at server construction, never per request/session),
 // so it cannot differ between two sessions and needs no differentiation.
 type proxiedToolSetKey struct {
-	url           string
-	apiKey        string
-	accessToken   string
-	idToken       string
-	orgID         int64
-	timeout       time.Duration
-	basicAuthUser string
-	basicAuthPass string
-	tlsCertFile   string
-	tlsKeyFile    string
-	tlsCAFile     string
-	tlsSkipVerify bool
-	extraHeaders  string // sorted, unambiguously-encoded ExtraHeaders
+	url            string
+	apiKey         string
+	accessToken    string
+	idToken        string
+	orgID          int64
+	timeout        time.Duration
+	basicAuthUser  string
+	basicAuthPass  string
+	tlsCertFile    string
+	tlsKeyFile     string
+	tlsCAFile      string
+	tlsSkipVerify  bool
+	extraHeaders   string // sorted, unambiguously-encoded ExtraHeaders
+	socks5ProxyURL string
 }
 
 // proxiedToolSetKeyFromContext builds a proxiedToolSetKey from the GrafanaConfig
@@ -253,13 +506,14 @@ type proxiedToolSetKey struct {
 func proxiedToolSetKeyFromContext(ctx context.Context) proxiedToolSetKey {
 	config := GrafanaConfigFromContext(ctx)
 	key := proxiedToolSetKey{
-		url:          config.URL,
-		apiKey:       config.APIKey,
-		accessToken:  config.AccessToken,
-		idToken:      config.IDToken,
-		orgID:        config.OrgID,
-		timeout:      config.Timeout,
-		extraHeaders: serializeHeaders(config.ExtraHeaders),
+		url:            config.URL,
+		apiKey:         config.APIKey,
+		accessToken:    config.AccessToken,
+		idToken:        config.IDToken,
+		orgID:          config.OrgID,
+		timeout:        config.Timeout,
+		extraHeaders:   serializeHeaders(config.ExtraHeaders),
+		socks5ProxyURL: config.SOCKS5ProxyURL,
 	}
 	if config.BasicAuth != nil {
 		key.basicAuthUser = config.BasicAuth.Username()
@@ -300,18 +554,18 @@ func serializeHeaders(headers map[string]string) string {
 }
 
 // String returns a redacted string representation for logging: secret-bearing
-// fields (apiKey, accessToken, idToken, basicAuthPass) are reduced to a present/
-// absent bool, never their value.
+// fields (apiKey, accessToken, idToken, basicAuthPass, socks5ProxyURL) are
+// reduced to a present/absent bool, never their value.
 func (k proxiedToolSetKey) String() string {
-	return fmt.Sprintf("url=%s apiKey=%t accessToken=%t idToken=%t orgID=%d timeout=%s basicAuth=%t tlsCert=%t tlsCA=%t tlsSkipVerify=%t extraHeaders=%t",
+	return fmt.Sprintf("url=%s apiKey=%t accessToken=%t idToken=%t orgID=%d timeout=%s basicAuth=%t tlsCert=%t tlsCA=%t tlsSkipVerify=%t extraHeaders=%t socks5Proxy=%t",
 		k.url, k.apiKey != "", k.accessToken != "", k.idToken != "", k.orgID, k.timeout, k.basicAuthUser != "",
-		k.tlsCertFile != "", k.tlsCAFile != "", k.tlsSkipVerify, k.extraHeaders != "")
+		k.tlsCertFile != "", k.tlsCAFile != "", k.tlsSkipVerify, k.extraHeaders != "", k.socks5ProxyURL != "")
 }
 
 // LogValue makes proxiedToolSetKey a slog.LogValuer so that logging it (e.g.
 // slog "key", set.key) emits the redacted String() form. slog does NOT honor
 // fmt.Stringer for Any values, so without this the raw struct fields (including
-// the secret apiKey/accessToken/idToken/basicAuthPass) would be reflected into
+// the secret apiKey/accessToken/idToken/basicAuthPass/socks5ProxyURL) would be reflected into
 // logs.
 func (k proxiedToolSetKey) LogValue() slog.Value {
 	return slog.StringValue(k.String())
@@ -371,6 +625,10 @@ type proxiedToolSet struct {
 	// toolToDatasources maps a proxied tool name to the datasource keys that
 	// support it. Empty until built is true; immutable afterwards.
 	toolToDatasources map[string][]string
+	// connectionOrgID is the org a call targets when it omits orgId. Resolved
+	// during the build. Every session sharing this set shares the same
+	// connection-level org, because proxiedToolSetKey includes OrgID.
+	connectionOrgID int64
 
 	// refs is the number of live sessions currently attached to this set.
 	refs int
@@ -395,7 +653,10 @@ type ToolManager struct {
 	// These will be unused for HTTP/SSE transports.
 	serverMode    bool // true if using server-wide tools (stdio), false for per-session (HTTP/SSE)
 	serverClients map[string]*ProxiedClient
-	clientsMutex  sync.RWMutex
+	// connectionOrgID is the org a proxied call targets when it omits orgId in
+	// server (stdio) mode. Resolved during discovery; guarded by clientsMutex.
+	connectionOrgID int64
+	clientsMutex    sync.RWMutex
 
 	// For HTTP/SSE transport: shared, credential-keyed proxied tool sets.
 	// Sessions with identical credentials share a single entry, so memory no
@@ -412,6 +673,19 @@ type ToolManager struct {
 	// defaults to buildProxiedToolSet and is a field only so tests can inject a
 	// fake builder that avoids real discovery/network I/O.
 	buildSet func(ctx context.Context, logger *slog.Logger) (builtProxiedTools, error)
+
+	// sessionAttachWaitBudget bounds how long InitializeAndRegisterProxiedTools
+	// waits for a shared proxiedToolSet build before giving up for one hook
+	// invocation; see defaultSessionAttachWaitBudget's doc comment. It defaults
+	// to that constant and is a field only so tests can shorten it instead of
+	// waiting out the real budget.
+	sessionAttachWaitBudget time.Duration
+
+	// metrics holds OTel instruments for discovery/connect observability.
+	metrics discoveryMetrics
+	// meterProvider is the metric.MeterProvider used to build metrics, set via
+	// WithToolManagerMeterProvider.
+	meterProvider metric.MeterProvider
 }
 
 // NewToolManager creates a new ToolManager
@@ -425,14 +699,27 @@ func NewToolManager(sm *SessionManager, mcpServer *server.MCPServer, opts ...too
 	for _, opt := range opts {
 		opt(tm)
 	}
+	tm.metrics = newDiscoveryMetrics(tm.meterProvider)
 	if tm.logger == nil {
 		tm.logger = slog.Default()
 	}
 	if tm.buildSet == nil {
 		tm.buildSet = tm.buildProxiedToolSet
 	}
+	if tm.sessionAttachWaitBudget == 0 {
+		tm.sessionAttachWaitBudget = defaultSessionAttachWaitBudget
+	}
 	if tm.proxiedSets == nil {
 		tm.proxiedSets = make(map[proxiedToolSetKey]*proxiedToolSet)
+	}
+	// Every session-mode call path (SessionManager.GetProxiedClient) needs
+	// sm.toolManager to look up a session's shared proxied client set; without
+	// it, every proxied tool call fails as if no datasources were discovered,
+	// no matter how well discovery/registration went. Wiring it here, rather
+	// than leaving it to the caller, means a caller that only calls
+	// NewToolManager can't forget this step.
+	if sm != nil {
+		sm.SetToolManager(tm)
 	}
 	return tm
 }
@@ -450,6 +737,19 @@ func WithProxiedTools(enabled bool) toolManagerOption {
 func WithToolManagerLogger(logger *slog.Logger) toolManagerOption {
 	return func(tm *ToolManager) {
 		tm.logger = logger
+	}
+}
+
+// WithToolManagerMeterProvider sets the metric.MeterProvider used to create
+// the ToolManager's discovery/connect OTel instruments. If unset (or passed
+// as nil), the ToolManager falls back to otel.GetMeterProvider(), matching
+// the pre-existing behavior. Callers embedding mcp-grafana as a library and
+// running with a non-global MeterProvider (e.g. because the process resets
+// the global provider to a noop for unrelated reasons) should pass their own
+// provider here so these metrics actually reach a scrapeable registry.
+func WithToolManagerMeterProvider(mp metric.MeterProvider) toolManagerOption {
+	return func(tm *ToolManager) {
+		tm.meterProvider = mp
 	}
 }
 
@@ -476,7 +776,7 @@ func (tm *ToolManager) InitializeAndRegisterServerTools(ctx context.Context) err
 	logger := tm.loggerFromCtx(ctx)
 
 	// Discover datasources with MCP support
-	discovered, err := discoverMCPDatasources(ctx, logger)
+	discovered, _, connectionOrg, err := discoverMCPDatasources(ctx, logger, tm.metrics)
 	if err != nil {
 		return fmt.Errorf("failed to discover MCP datasources: %w", err)
 	}
@@ -488,13 +788,14 @@ func (tm *ToolManager) InitializeAndRegisterServerTools(ctx context.Context) err
 
 	// Connect to each datasource and store in manager
 	tm.clientsMutex.Lock()
+	tm.connectionOrgID = connectionOrg
 	for _, ds := range discovered {
-		client, err := NewProxiedClient(ctx, ds.UID, ds.Name, ds.Type, ds.MCPURL)
+		client, err := NewProxiedClient(ctx, ds.OrgID, ds.UID, ds.Name, ds.Type, ds.MCPURL)
 		if err != nil {
 			logger.ErrorContext(ctx, "failed to create proxied client", "datasource", ds.UID, "error", err)
 			continue
 		}
-		key := ds.Type + "_" + ds.UID
+		key := proxiedClientKey(ds.OrgID, ds.Type, ds.UID)
 		tm.serverClients[key] = client
 	}
 	clientCount := len(tm.serverClients)
@@ -531,6 +832,15 @@ func (tm *ToolManager) InitializeAndRegisterServerTools(ctx context.Context) err
 	return nil
 }
 
+// buildStats summarizes how a build's candidate datasources fared, for the
+// "built proxied tool set" summary log. Zero-value-safe: builders that don't
+// populate it (e.g. test seams) simply report zeros.
+type buildStats struct {
+	candidates    int // datasources of an MCP-enabled type, before probing
+	discovered    int // candidates that passed the MCP probe
+	connectFailed int // discovered datasources that failed to connect (after retries)
+}
+
 // builtProxiedTools is the result of a build, held in local variables while the
 // build runs so that nothing shared is mutated without the cache lock. It is
 // published into a proxiedToolSet in a single critical section.
@@ -538,6 +848,8 @@ type builtProxiedTools struct {
 	clients           map[string]*ProxiedClient
 	tools             []mcp.Tool
 	toolToDatasources map[string][]string
+	stats             buildStats
+	connectionOrgID   int64
 }
 
 // buildProxiedToolSet discovers datasources, connects to them, and returns the
@@ -565,21 +877,103 @@ func (tm *ToolManager) buildProxiedToolSet(ctx context.Context, logger *slog.Log
 	}()
 
 	// Discover datasources with MCP support.
-	discovered, err := discoverMCPDatasources(ctx, logger)
+	discovered, candidateCount, connectionOrg, err := discoverMCPDatasources(ctx, logger, tm.metrics)
 	if err != nil {
 		logger.ErrorContext(ctx, "failed to discover MCP datasources", "error", err)
 		return built, fmt.Errorf("failed to discover MCP datasources: %w", err)
 	}
+	built.connectionOrgID = connectionOrg
 
-	// Connect to each discovered datasource.
+	// Connect to each discovered datasource in parallel, retrying transient
+	// failures, mirroring the probe step's concurrency pattern in
+	// discoverMCPDatasources. A failed connect is non-fatal to the overall
+	// build: it just excludes that datasource.
+	type connectResult struct {
+		key    string
+		client *ProxiedClient
+		failed bool
+	}
+	connectResults := make(chan connectResult, len(discovered))
+	var connectWg sync.WaitGroup
+
 	for _, ds := range discovered {
-		client, err := NewProxiedClient(ctx, ds.UID, ds.Name, ds.Type, ds.MCPURL)
-		if err != nil {
-			logger.ErrorContext(ctx, "failed to create proxied client", "datasource", ds.UID, "error", err)
+		connectWg.Add(1)
+		go func(ds DiscoveredDatasource) {
+			defer connectWg.Done()
+
+			typeAttr := metric.WithAttributes(attribute.String("datasource.type", ds.Type))
+			description := fmt.Sprintf("connect to MCP server for datasource %s (%s)", ds.Name, ds.UID)
+
+			// Connect work now runs in its own goroutine (parallelized, unlike
+			// the sequential loop this replaced), so a panic here would
+			// otherwise crash the whole process instead of being turned into
+			// an error by buildProxiedToolSet's top-level recover, which only
+			// guards its own goroutine. Recover here too, closing any client
+			// that connected before the panic so it isn't leaked, and report
+			// this candidate as failed rather than letting the panic escape.
+			var client *ProxiedClient
+			defer func() {
+				if r := recover(); r != nil {
+					logger.ErrorContext(ctx, "panic connecting to proxied MCP client; excluding datasource",
+						"datasource", ds.UID, "name", ds.Name, "type", ds.Type, "panic", r)
+					tm.metrics.connectDeterministicFailure.Add(ctx, 1, typeAttr)
+					if client != nil {
+						if err := client.Close(); err != nil {
+							logger.ErrorContext(ctx, "failed to close proxied client after panic", "datasource", ds.UID, "error", err)
+						}
+					}
+					connectResults <- connectResult{failed: true}
+				}
+			}()
+
+			var connectErr error
+			client, connectErr = withRetry(ctx, defaultRetryPolicy, description,
+				func(attemptNum int) (*ProxiedClient, error) {
+					if attemptNum > 1 {
+						tm.metrics.connectRetries.Add(ctx, 1, typeAttr)
+					}
+					c, err := NewProxiedClient(ctx, ds.OrgID, ds.UID, ds.Name, ds.Type, ds.MCPURL)
+					if err != nil {
+						return nil, classifyConnectError(err)
+					}
+					return c, nil
+				})
+
+			if connectErr != nil {
+				if isTransient(connectErr) {
+					tm.metrics.connectTransientFailure.Add(ctx, 1, typeAttr)
+				} else {
+					tm.metrics.connectDeterministicFailure.Add(ctx, 1, typeAttr)
+				}
+				logger.WarnContext(ctx, "failed to create proxied client after retries; excluding datasource from proxied tool set",
+					"datasource", ds.UID, "name", ds.Name, "type", ds.Type, "error", connectErr)
+				connectResults <- connectResult{failed: true}
+				return
+			}
+
+			tm.metrics.connectSuccess.Add(ctx, 1, typeAttr)
+			connectResults <- connectResult{key: proxiedClientKey(ds.OrgID, ds.Type, ds.UID), client: client}
+		}(ds)
+	}
+
+	go func() {
+		connectWg.Wait()
+		close(connectResults)
+	}()
+
+	connectFailed := 0
+	for r := range connectResults {
+		if r.failed {
+			connectFailed++
 			continue
 		}
-		key := ds.Type + "_" + ds.UID
-		built.clients[key] = client
+		built.clients[r.key] = r.client
+	}
+
+	built.stats = buildStats{
+		candidates:    candidateCount,
+		discovered:    len(discovered),
+		connectFailed: connectFailed,
 	}
 
 	// Collect unique tools and track which datasources support each one.
@@ -719,6 +1113,7 @@ func (tm *ToolManager) runProxiedToolSetBuild(ctx context.Context, set *proxiedT
 		set.clients = built.clients
 		set.tools = built.tools
 		set.toolToDatasources = built.toolToDatasources
+		set.connectionOrgID = built.connectionOrgID
 		set.built = true
 	}
 	abandoned := set.refs == 0
@@ -726,16 +1121,20 @@ func (tm *ToolManager) runProxiedToolSetBuild(ctx context.Context, set *proxiedT
 	size := len(tm.proxiedSets)
 	tm.proxiedSetsMu.Unlock()
 
-	close(set.ready)
-
 	// On any non-publish outcome the freshly-built clients were NOT stored on the
 	// set, so no teardown path can observe or close them: close them here (once,
 	// outside the lock) or their remote connections leak. This covers both the
 	// abandoned case (all sessions left mid-build) and the failed case where the
 	// builder connected some clients before erroring or panicking.
+	//
+	// Closing BEFORE signaling ready ensures that by the time any waiter unblocks
+	// and observes the failure, the cleanup is already complete. The built clients
+	// are local (never published to set.clients), so no waiter accesses them.
 	if !published {
 		tm.closeProxiedClients(built.clients)
 	}
+
+	close(set.ready)
 
 	switch {
 	case abandoned:
@@ -745,7 +1144,9 @@ func (tm *ToolManager) runProxiedToolSetBuild(ctx context.Context, set *proxiedT
 		logger.InfoContext(ctx, "proxied tool set build failed; not caching", "key", set.key, "error", buildErr)
 		return
 	}
-	logger.InfoContext(ctx, "built proxied tool set", "key", set.key, "datasources", len(set.clients), "tools", len(set.tools), "cache_size", size)
+	logger.InfoContext(ctx, "built proxied tool set", "key", set.key,
+		"candidates", built.stats.candidates, "discovered", built.stats.discovered, "connect_failed", built.stats.connectFailed,
+		"datasources", len(set.clients), "tools", len(set.tools), "cache_size", size)
 }
 
 // releaseProxiedToolSet decrements a set's reference count and, once no session
@@ -804,7 +1205,7 @@ func (tm *ToolManager) closeProxiedClients(clients map[string]*ProxiedClient) {
 // client while the call runs. The returned release func MUST be called (deferred)
 // once the call completes; it decrements the in-flight count and closes the set
 // if it was the last thing keeping it alive.
-func (tm *ToolManager) acquireProxiedClientForCall(set *proxiedToolSet, datasourceType, datasourceUID string) (*ProxiedClient, func(), error) {
+func (tm *ToolManager) acquireProxiedClientForCall(set *proxiedToolSet, orgID int64, datasourceType, datasourceUID string) (*ProxiedClient, func(), error) {
 	tm.proxiedSetsMu.Lock()
 	defer tm.proxiedSetsMu.Unlock()
 
@@ -812,19 +1213,22 @@ func (tm *ToolManager) acquireProxiedClientForCall(set *proxiedToolSet, datasour
 		return nil, nil, fmt.Errorf("datasource '%s' is no longer available", datasourceUID)
 	}
 
-	key := datasourceType + "_" + datasourceUID
-	client, ok := set.clients[key]
+	// A call that omits orgId targets the connection org.
+	if orgID <= 0 {
+		orgID = set.connectionOrgID
+	}
+	client, ok := set.clients[proxiedClientKey(orgID, datasourceType, datasourceUID)]
 	if !ok {
 		var availableUIDs []string
 		for _, c := range set.clients {
-			if c.DatasourceType == datasourceType {
+			if c.DatasourceType == datasourceType && c.OrgID == orgID {
 				availableUIDs = append(availableUIDs, c.DatasourceUID)
 			}
 		}
 		if len(availableUIDs) > 0 {
-			return nil, nil, fmt.Errorf("datasource '%s' not found. Available %s datasources: %v", datasourceUID, datasourceType, availableUIDs)
+			return nil, nil, fmt.Errorf("datasource '%s' not found in org %d. Available %s datasources: %v", datasourceUID, orgID, datasourceType, availableUIDs)
 		}
-		return nil, nil, fmt.Errorf("datasource '%s' not found. No %s datasources with MCP support are configured", datasourceUID, datasourceType)
+		return nil, nil, fmt.Errorf("datasource '%s' not found in org %d. No %s datasources with MCP support are configured", datasourceUID, orgID, datasourceType)
 	}
 
 	set.inFlight++
@@ -846,6 +1250,12 @@ func (tm *ToolManager) acquireProxiedClientForCall(set *proxiedToolSet, datasour
 // credentials reuse a single set instead of each building their own. This is
 // called from OnBeforeListTools and OnBeforeCallTool hooks for HTTP/SSE
 // transports and is idempotent per session.
+//
+// A call waits for the build for at most tm.sessionAttachWaitBudget, not for
+// however long the build actually takes: the build runs in the background and
+// keeps going past that budget, so a call that gives up here registers
+// nothing now but leaves its reference in place for a later hook invocation
+// to retry, by which point the build has very likely already published.
 func (tm *ToolManager) InitializeAndRegisterProxiedTools(ctx context.Context, session server.ClientSession) {
 	if !tm.enableProxiedTools {
 		return
@@ -879,28 +1289,73 @@ func (tm *ToolManager) InitializeAndRegisterProxiedTools(ctx context.Context, se
 		return
 	}
 
-	// attachProxiedToolSet takes the reference AND binds the set to the session
-	// atomically (under proxiedSetsMu), so there is no window where a reference
-	// exists that teardown cannot find and release.
-	set, needsBuild := tm.attachProxiedToolSet(state, key)
+	// If an earlier hook invocation for this session already attached to this
+	// exact credential-keyed set but gave up waiting (sessionAttachWaitBudget
+	// elapsed before the build published), reuse that same attachment and its
+	// already-held reference instead of attaching again, which would take a
+	// second reference this session will never balance with a second release.
+	state.mutex.RLock()
+	existingSet := state.proxiedSet
+	state.mutex.RUnlock()
 
-	// Reconcile against a teardown that raced this attach. A session may have been
-	// removed from the SessionManager (client DELETE / idle sweeper / reaper)
-	// between GetSession/CreateSession above and the bind inside
-	// attachProxiedToolSet. If so, that RemoveSession saw proxiedSet==nil and did
-	// not release, and no future teardown will fire for this (now untracked)
-	// session, so the ref we just took would leak. Detect it and release exactly
-	// once (releaseSessionProxiedToolSet is idempotent, so a RemoveSession that
-	// instead ran AFTER our bind is handled too, with no double release). We still
-	// run/await the build below so any live waiter for the same key is served.
-	if !tm.sm.sessionRegistered(sessionID, state) {
-		defer tm.releaseSessionProxiedToolSet(state)
+	var set *proxiedToolSet
+	var needsBuild bool
+	if existingSet != nil && existingSet.key == key {
+		set = existingSet
+	} else {
+		if existingSet != nil {
+			// The session's credentials changed since an earlier hook invocation
+			// left it attached to a different set (e.g. a rotated access/ID token
+			// between the timed-out attempt and this retry). Release that stale
+			// reference before taking a new one: attachProxiedToolSet below would
+			// otherwise overwrite state.proxiedSet without ever releasing it,
+			// leaking the old set's reference (and its clients) forever.
+			tm.releaseSessionProxiedToolSet(state)
+		}
+
+		// attachProxiedToolSet takes the reference AND binds the set to the
+		// session atomically (under proxiedSetsMu), so there is no window where a
+		// reference exists that teardown cannot find and release.
+		set, needsBuild = tm.attachProxiedToolSet(state, key)
+
+		// Reconcile against a teardown that raced this attach. A session may have
+		// been removed from the SessionManager (client DELETE / idle sweeper /
+		// reaper) between GetSession/CreateSession above and the bind inside
+		// attachProxiedToolSet. If so, that RemoveSession saw proxiedSet==nil and
+		// did not release, and no future teardown will fire for this (now
+		// untracked) session, so the ref we just took would leak. Detect it and
+		// release exactly once (releaseSessionProxiedToolSet is idempotent, so a
+		// RemoveSession that instead ran AFTER our bind is handled too, with no
+		// double release). We still run/await the build below so any live waiter
+		// for the same key is served.
+		if !tm.sm.sessionRegistered(sessionID, state) {
+			defer tm.releaseSessionProxiedToolSet(state)
+		}
 	}
 
 	if needsBuild {
-		tm.runProxiedToolSetBuild(ctx, set, logger)
-	} else {
-		<-set.ready
+		// Run the build in its own goroutine rather than inline, so that EVERY
+		// caller (first and followers alike) waits on set.ready the same way and
+		// can give up after tm.sessionAttachWaitBudget without cutting the build
+		// itself short: runProxiedToolSetBuild already detaches from ctx via
+		// context.WithoutCancel internally, so it keeps running for whichever
+		// session (this one, on retry, or another) asks next.
+		go tm.runProxiedToolSetBuild(ctx, set, logger)
+	}
+
+	select {
+	case <-set.ready:
+	case <-time.After(tm.sessionAttachWaitBudget):
+		// The build is still running. Don't register anything now: this
+		// session's reference to the set is left in place (state.proxiedSet
+		// stays bound, proxiedRegistered stays false), so the next
+		// OnBeforeListTools/OnBeforeCallTool hook for this session retries the
+		// attach above, reuses this same reference, and very likely finds the
+		// build already published. This is an expected, routine outcome for a
+		// build with several or slow-to-probe candidates, not a failure.
+		logger.DebugContext(ctx, "proxied tool set build still in progress after wait budget; will retry on next hook invocation",
+			"session", sessionID, "wait", tm.sessionAttachWaitBudget)
+		return
 	}
 
 	// Read the published results under the lock: set.built/failed/tools are only
@@ -973,25 +1428,28 @@ func (tm *ToolManager) releaseSessionProxiedToolSet(state *SessionState) {
 }
 
 // GetServerClient retrieves a proxied client from server-level storage (for stdio transport)
-func (tm *ToolManager) GetServerClient(datasourceType, datasourceUID string) (*ProxiedClient, error) {
+func (tm *ToolManager) GetServerClient(orgID int64, datasourceType, datasourceUID string) (*ProxiedClient, error) {
 	tm.clientsMutex.RLock()
 	defer tm.clientsMutex.RUnlock()
 
-	key := datasourceType + "_" + datasourceUID
-	client, exists := tm.serverClients[key]
+	// A call that omits orgId targets the connection org.
+	if orgID <= 0 {
+		orgID = tm.connectionOrgID
+	}
+	client, exists := tm.serverClients[proxiedClientKey(orgID, datasourceType, datasourceUID)]
 	if !exists {
-		// List available datasources to help with debugging
+		// List available datasources (in this org) to help with debugging
 		var availableUIDs []string
 		for _, c := range tm.serverClients {
-			if c.DatasourceType == datasourceType {
+			if c.DatasourceType == datasourceType && c.OrgID == orgID {
 				availableUIDs = append(availableUIDs, c.DatasourceUID)
 			}
 		}
 
 		if len(availableUIDs) > 0 {
-			return nil, fmt.Errorf("datasource '%s' not found. Available %s datasources: %v", datasourceUID, datasourceType, availableUIDs)
+			return nil, fmt.Errorf("datasource '%s' not found in org %d. Available %s datasources: %v", datasourceUID, orgID, datasourceType, availableUIDs)
 		}
-		return nil, fmt.Errorf("datasource '%s' not found. No %s datasources with MCP support are configured", datasourceUID, datasourceType)
+		return nil, fmt.Errorf("datasource '%s' not found in org %d. No %s datasources with MCP support are configured", datasourceUID, orgID, datasourceType)
 	}
 
 	return client, nil

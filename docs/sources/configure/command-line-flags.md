@@ -31,15 +31,16 @@ You can look up defaults, choose `--disable-*` flags, or configure TLS without r
 - `--base-path`: Base path for the SSE or streamable-http server.
 - `--endpoint-path`: HTTP path for the streamable-http MCP endpoint. Default: `/mcp`.
 - `--session-idle-timeout-minutes`: Idle timeout for streamable-http sessions, in minutes. Sessions with no activity for this duration are automatically reaped. Set to `0` to disable. Default: `30`.
+- `--instructions-append`: Text appended to the server instructions returned to MCP clients on initialize, so every connecting agent sees it.
 
 ## Configure HTTP transport security
 
-The SSE and streamable-http transports validate `Host` and `Origin` headers on every route (`/sse`, `/mcp`, `/healthz`, `/metrics`) to block DNS-rebinding attacks. Stdio transport is unaffected.
+The SSE and streamable-http transports validate `Host` and `Origin` headers on every route on the MCP listener (`/sse`, `/mcp`, and `/healthz` / `/metrics` when they stay on that listener) to block DNS-rebinding attacks. Stdio transport is unaffected. Side listeners started by `--healthz-address` or `--metrics-address` are not wrapped.
 
-- `--allowed-hosts`: Comma-separated allowlist of `Host` header values. When unset (or when the parsed value is empty — for example, `,,,`), it falls back to loopback variants of `--address` (for example, `localhost:8000`, `127.0.0.1:8000`, `[::1]:8000`). Pass `*` to disable the check — only safe behind a trusted reverse proxy that rewrites `Host`.
+- `--allowed-hosts`: Comma-separated allowlist of `Host` header values. When unset (or when the parsed value is empty — for example, `,,,`), it falls back to loopback variants of `--address` (for example, `localhost:8000`, `127.0.0.1:8000`, `[::1]:8000`). Pass `*` to disable `Host` validation — only safe when a trusted reverse proxy validates `Host`.
 - `--allowed-origins`: Comma-separated allowlist of `Origin` header values. Empty by default — any request that carries an `Origin` header is rejected (browsers always send `Origin` for cross-origin requests, and no browser should be calling this server directly). Pass an explicit list to permit browser clients, or `*` to disable the check.
 
-When deploying behind an ingress or reverse proxy that forwards the original `Host`, set `--allowed-hosts` to the expected hostname (or `*` if the proxy is fully trusted). Kubernetes `httpGet` liveness/readiness probes send `Host: <pod-ip>:<port>` by default — either set `--allowed-hosts '*'`, override the probe's `host:` field, or use a `tcpSocket` probe. External `/metrics` scrapes must add the scrape source's `Host` to the allowlist (or use `--metrics-address` to bind metrics on a separate port, which is unaffected).
+When deploying behind an ingress or reverse proxy that forwards the original `Host`, set `--allowed-hosts` to the expected hostname (for example, `--allowed-hosts mcp.example.com`). Kubernetes `httpGet` liveness/readiness probes send `Host: <pod-ip>:<port>` by default — either set `--allowed-hosts '*'`, override the probe's `host:` field, use a `tcpSocket` probe, or bind `/healthz` on `--healthz-address` (and `/metrics` on `--metrics-address`). Those side listeners are not wrapped by Host/Origin validation.
 
 ## Configure caller authentication
 
@@ -74,12 +75,13 @@ When caller authentication is enabled, the `Authorization` header is reserved fo
 
 - `--metrics`: Expose a Prometheus metrics endpoint at `/metrics` (SSE and streamable-http only).
 - `--metrics-address`: Optional separate listen address for metrics (for example, `:9090`). If empty, metrics are served on the main HTTP server.
+- `--healthz-address`: Optional separate listen address for `/healthz` (for example, `:8080`). If empty, `/healthz` is served on the main HTTP server. If this matches `--metrics-address`, both routes share one extra listener. The side listener is not wrapped by Host/Origin validation, so Kubernetes probes can reach it while `--address` stays on loopback.
 
 ## Configure tool categories
 
 - `--enabled-tools`: Comma-separated list of enabled tool **categories**. The default is exactly:
 
-  `search,datasource,incident,prometheus,loki,alerting,dashboard,folder,oncall,asserts,sift,pyroscope,navigation,proxied,annotations,rendering,snapshot`
+  `search,datasource,incident,prometheus,loki,alerting,dashboard,folder,oncall,asserts,sift,pyroscope,navigation,proxied,annotations,rendering,snapshot,docs`
 
   Categories **not** in that default string are off until you add them, including: `admin`, `agento11y`, `assistant`, `elasticsearch`, `cloudwatch`, `examples`, `clickhouse`, `snowflake`, `influxdb`, `quickwit`, and `runpanelquery`. Pass a full comma-separated list to replace the default entirely, or use `--disable-*` flags to turn off pieces of the default set.
 
@@ -88,6 +90,8 @@ When caller authentication is enabled, the `Authorization` header is reserved fo
 - `--disable-incident`: Disable incident tools.
 - `--disable-prometheus`: Disable Prometheus tools.
 - `--disable-write`: Disable write tools (read-only mode; refer to the following section).
+- `--disable-query`: Disable query tools (tools that execute a query against a datasource; refer to the following section).
+- `--enable-query`: Keep the raw-SQL query tools registered under `--disable-write` (refer to the following section).
 - `--disable-loki`: Disable Loki tools.
 - `--disable-elasticsearch`: Disable Elasticsearch tools.
 - `--disable-quickwit`: Disable Quickwit tools.
@@ -113,14 +117,73 @@ When caller authentication is enabled, the `Authorization` header is reserved fo
 - `--disable-provisioning`: Disable provisioning tools.
 - `--disable-agento11y`: Disable Agent Observability tools.
 - `--disable-assistant`: Disable Grafana Assistant tools.
+- `--disable-docs`: Disable documentation tools.
+- `--disable-user`: Disable user info tools.
 
 ## Configure tool limits
 
 - `--max-loki-log-limit`: Maximum number of log lines returned per `query_loki_logs` call.
+- `--loki-guardrail-mode`: Loki query cost guardrail for `query_loki_logs`: `off` (default), `shadow` (log queries that would be blocked, but let them run), or `enforce` (reject them with rewrite guidance). The guardrail requires a selective stream selector, caps the effective time range (including range-vector durations like `[30d]`), and pre-checks Loki's index/stats byte estimate before running the query. On VictoriaLogs it applies only to selector-shaped (`{...}`) queries — brace-less LogsQL passes through entirely and the byte-budget check never applies. Falls back to the `GRAFANA_LOKI_GUARDRAIL_MODE` environment variable.
+- `--loki-guardrail-max-bytes`: Maximum bytes a single `query_loki_logs` call may scan, estimated via Loki's index/stats API. Defaults to 100 GiB; `0` disables the byte-budget check. Falls back to `GRAFANA_LOKI_GUARDRAIL_MAX_BYTES`.
+- `--loki-guardrail-max-range`: Maximum effective time range for a single `query_loki_logs` call, including range-vector durations. Defaults to `24h`; `0` disables the range check. Falls back to `GRAFANA_LOKI_GUARDRAIL_MAX_RANGE`.
+
+The guardrail's decisions are also exported as OTel counters (`mcp_loki_guardrail_admitted_total`, `_would_block_total`, `_blocked_total`, `_fail_open_total`), which is the recommended way to size the affected population before promoting from `shadow` to `enforce`. See [Observability](../../developer/observability-metrics-and-tracing/#loki-cost-guardrail-metrics).
+- `--dynamic-multi-org`: Allow tool calls to select a Grafana organization per call via an optional `orgId` argument. Off by default. See [Multi-organization support](../multi-organization-and-headers/).
+
+## Run without query execution
+
+`--disable-query` removes every tool that executes a query against a datasource, and leaves the metadata and discovery tools in place.
+
+Use it when the assistant should be able to explore what exists — datasources, dashboards, metric names, labels, table schemas — without running potentially expensive or data-revealing queries; for example, with a service account that has `datasources:read` but not `datasources:query`.
+
+The following tools are not registered when the flag is set:
+
+- Prometheus: `query_prometheus`, `query_prometheus_histogram`
+- Loki: `query_loki_logs`, `query_loki_patterns` (`query_loki_stats` and `analyze_loki_labels` read the index rather than returning log content, so they stay registered)
+- Elasticsearch and OpenSearch, Quickwit: `query_elasticsearch`, `query_quickwit`
+- SQL datasources: `query_clickhouse`, `query_snowflake`, `query_athena`, `query_influxdb`
+- Graphite: `query_graphite`, `query_graphite_density`
+- CloudWatch: `query_cloudwatch`
+- Pyroscope: `query_pyroscope`
+- Panels: `run_panel_query`
+
+The `elasticsearch`, `quickwit`, `influxdb`, and `runpanelquery` categories contain nothing else, so they expose no tools at all when queries are disabled. Sibling tools such as `list_prometheus_metric_names`, `list_loki_label_values`, `describe_clickhouse_table`, and `list_cloudwatch_metrics` remain available.
+
+The flag gates the query tools and the `grafana_api_request` POST-to-`/api/ds/query` path, but doesn't police every route to a datasource. In read-only mode, `grafana_api_request` allows POST to `/api/ds/query` only when query tools are enabled (same gate as the raw-SQL tools — blocked by `--disable-write` unless `--enable-query` overrides). `get_panel_image`, which renders a panel server-side, is unaffected.
+
+### Query execution and read-only mode
+
+The raw-SQL query tools — `query_clickhouse`, `query_snowflake`, `query_athena`, and `query_influxdb` — send the query to the datasource unfiltered, so they write whenever the datasource credentials permit it. Read-only mode removes them along with the other write tools.
+
+`--enable-query` puts them back. Use it when the datasource credentials are known to be read-only and you want query execution in an otherwise read-only server. It doesn't re-enable any other write tool, and it has no effect alongside `--disable-query`, which always wins.
+
+| Flags | Safe query tools | Raw-SQL query tools |
+| --- | --- | --- |
+| _(none)_ | Registered | Registered |
+| `--disable-write` | Registered | Not registered |
+| `--disable-write --enable-query` | Registered | Registered |
+| `--disable-query` | Not registered | Not registered |
+| `--disable-query --enable-query` | Not registered | Not registered |
+
+## Restrict which Loki streams can be read
+
+- `--loki-enforced-matchers`: LogQL label matchers AND-ed into every native-Loki query to restrict which log streams can be read (e.g. `environment=~"prod|staging"`). Unparseable queries are rejected; VictoriaLogs datasources are refused while set.
+- `--loki-label-enumeration-fallback`: What the label-enumeration tools do when negative enforced matchers can't scope them: `reject` (default) or `unfiltered`.
+
+{{< admonition type="warning" >}}
+Enforcement applies only to the Loki query tools. Other tools can reach Loki log data through paths that never touch the enforced backend, so you must also disable them for the restriction to hold:
+
+- `--disable-api`: `grafana_api_request` can query the Loki datasource proxy directly (full bypass).
+- `--disable-rendering`: `get_panel_image` renders Loki panels server-side, producing images with unrestricted log lines.
+- `--disable-sift`: Sift investigations analyze Loki logs server-side across all streams.
+- `--disable-assistant`: `ask_assistant` delegates to Grafana Assistant, which reads Loki server-side across all streams. It is only registered when write tools are enabled, so `--disable-write` closes it too.
+
+The server logs a warning at startup naming each of these that is still enabled. `run_panel_query` is safe (it reuses the enforced query path). Proxied tools currently expose only Tempo (traces), not Loki logs, so they are not a bypass today. Dashboard snapshots (`--disable-snapshot`) can embed log-panel data captured outside enforcement.
+{{< /admonition >}}
 
 ## Run in read-only mode
 
-`--disable-write` prevents write operations to Grafana. Use it with read-only service accounts, safer production assistants, or to avoid accidental changes.
+`--disable-write` prevents write operations to Grafana. Use it with read-only service accounts, safer production assistants, or to avoid accidental changes. It also removes the raw-SQL query tools, which can write through the datasource; refer to the preceding section for `--enable-query`, which keeps them.
 
 When enabled, the following writes are disabled:
 
@@ -136,15 +199,21 @@ When enabled, the following writes are disabled:
 
 - `create_incident`
 - `add_activity_to_incident`
+- `update_incident`
 
 **Alerting tools**
 
 - `alerting_manage_rules` (create, update, delete)
 
+**OnCall tools**
+
+- `update_alert_group`
+
 **Annotation tools**
 
 - `create_annotation`
 - `update_annotation`
+- `delete_annotation`
 
 **Sift tools**
 
@@ -161,6 +230,8 @@ When enabled, the following writes are disabled:
 - `agento11y_manage_evaluators` (upsert, delete, fork, and test evaluators)
 - `agento11y_manage_eval_rules` (create, update, delete, and preview eval rules and guards)
 - `agento11y_manage_eval_collections` (save and delete saved conversations; create, update, and delete collections; add and remove collection members)
+- `agento11y_manage_experiments` (update and cancel experiments)
+- `agento11y_manage_test_suites` (create and update test suites; create and publish versions; upsert and delete test cases)
 
 Read operations (queries, lists, searches) stay available.
 

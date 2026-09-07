@@ -149,6 +149,73 @@ func TestListDatasources_TypeFilter(t *testing.T) {
 	})
 }
 
+func TestListDatasources_NameFilter(t *testing.T) {
+	mockDS := []*models.DataSource{
+		{ID: 1, UID: "prom-prod-eu", Name: "prometheus-prod-eu", Type: "prometheus"},
+		{ID: 2, UID: "prom-prod-us", Name: "prometheus-prod-us", Type: "prometheus"},
+		{ID: 3, UID: "prom-dev", Name: "prometheus-dev", Type: "prometheus"},
+		{ID: 4, UID: "loki-prod-eu", Name: "loki-prod-eu", Type: "loki"},
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(mockDS)
+	}))
+	defer server.Close()
+
+	ctx := mockDatasourcesCtx(server)
+
+	t.Run("empty name does not filter", func(t *testing.T) {
+		result, err := listDatasources(ctx, ListDatasourcesParams{Name: ""})
+		require.NoError(t, err)
+		assert.Equal(t, 4, result.Total)
+	})
+
+	t.Run("substring match across types", func(t *testing.T) {
+		result, err := listDatasources(ctx, ListDatasourcesParams{Name: "prod"})
+		require.NoError(t, err)
+		assert.Equal(t, 3, result.Total)
+		uids := make([]string, len(result.Datasources))
+		for i, ds := range result.Datasources {
+			uids[i] = ds.UID
+		}
+		assert.ElementsMatch(t, []string{"prom-prod-eu", "prom-prod-us", "loki-prod-eu"}, uids)
+	})
+
+	t.Run("case-insensitive match", func(t *testing.T) {
+		result, err := listDatasources(ctx, ListDatasourcesParams{Name: "PROD-EU"})
+		require.NoError(t, err)
+		assert.Equal(t, 2, result.Total)
+	})
+
+	t.Run("composes with type filter (AND)", func(t *testing.T) {
+		result, err := listDatasources(ctx, ListDatasourcesParams{Type: "prometheus", Name: "prod"})
+		require.NoError(t, err)
+		assert.Equal(t, 2, result.Total)
+		for _, ds := range result.Datasources {
+			assert.Equal(t, "prometheus", ds.Type)
+			assert.Contains(t, ds.Name, "prod")
+		}
+	})
+
+	t.Run("no match returns empty", func(t *testing.T) {
+		result, err := listDatasources(ctx, ListDatasourcesParams{Name: "does-not-exist"})
+		require.NoError(t, err)
+		assert.Equal(t, 0, result.Total)
+		assert.Empty(t, result.Datasources)
+	})
+
+	t.Run("name filter respects pagination", func(t *testing.T) {
+		// 3 datasources match "prod"; ask for page 2 with limit 2.
+		result, err := listDatasources(ctx, ListDatasourcesParams{Name: "prod", Limit: 2, Offset: 2})
+		require.NoError(t, err)
+		assert.Equal(t, 3, result.Total)
+		assert.Len(t, result.Datasources, 1)
+		assert.False(t, result.HasMore)
+	})
+}
+
 func TestGetDatasource_RoutesToUID(t *testing.T) {
 	mockDS := &models.DataSource{
 		ID:   1,
@@ -931,6 +998,147 @@ func TestCheckDatasourcesHealth_Pagination_OffsetBeyondTotal(t *testing.T) {
 	assert.Equal(t, 0, result.Unhealthy)
 	assert.False(t, result.HasMore)
 	assert.Empty(t, result.Results)
+}
+
+// newBulkHealthServerWithFrontendSettings extends newBulkHealthServer with a
+// GET /api/frontend/settings handler reporting meta.backend per UID, so
+// check_datasources_health can distinguish "genuinely unreachable" from
+// "this plugin has no backend to health-check" (issue #1069).
+func newBulkHealthServerWithFrontendSettings(
+	t *testing.T,
+	list []*models.DataSourceListItemDTO,
+	healthyUIDs map[string]bool,
+	backendByUID map[string]bool,
+) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/api/datasources":
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(list)
+		case r.URL.Path == "/api/frontend/settings":
+			datasources := make(map[string]any, len(list))
+			for _, ds := range list {
+				backend, known := backendByUID[ds.UID]
+				entry := map[string]any{
+					"id":   ds.ID,
+					"uid":  ds.UID,
+					"name": ds.Name,
+					"type": ds.Type,
+				}
+				if known {
+					entry["meta"] = map[string]any{"backend": backend}
+				}
+				datasources[ds.Name] = entry
+			}
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{"datasources": datasources})
+		default:
+			// /api/datasources/uid/{uid}/health
+			parts := strings.Split(r.URL.Path, "/")
+			uid := parts[len(parts)-2]
+			if healthyUIDs[uid] {
+				w.WriteHeader(http.StatusOK)
+				_ = json.NewEncoder(w).Encode(map[string]any{"status": "OK", "message": "Data source is working"})
+			} else {
+				w.WriteHeader(http.StatusOK)
+				_ = json.NewEncoder(w).Encode(map[string]any{"status": "ERROR", "message": "connection refused"})
+			}
+		}
+	}))
+}
+
+func TestCheckDatasourcesHealth_FrontendOnlyPluginReportsUnknownNotUnhealthy(t *testing.T) {
+	list := []*models.DataSourceListItemDTO{
+		{ID: 1, UID: "alertmanager", Name: "Alertmanager", Type: "alertmanager"},
+		{ID: 2, UID: "prom-1", Name: "Prometheus", Type: "prometheus"},
+	}
+	// The health endpoint would report "alertmanager" as ERROR if asked (it
+	// has no backend to serve /health), matching issue #1069's repro; the
+	// fix must never call it for a plugin frontend/settings marks
+	// meta.backend: false.
+	srv := newBulkHealthServerWithFrontendSettings(
+		t, list,
+		map[string]bool{"alertmanager": false, "prom-1": true},
+		map[string]bool{"alertmanager": false, "prom-1": true},
+	)
+	defer srv.Close()
+
+	result, err := checkDatasourcesHealth(mockDatasourcesCtx(srv), BulkCheckDatasourceHealthParams{})
+	require.NoError(t, err)
+	assert.Equal(t, 2, result.Total)
+	assert.Equal(t, 2, result.Checked)
+	assert.Equal(t, 1, result.Healthy)
+	assert.Equal(t, 0, result.Unhealthy, "a frontend-only plugin must not count as unhealthy")
+	assert.Equal(t, 1, result.Unknown)
+
+	var alertmanagerResult *DatasourceHealthCheckResult
+	for i := range result.Results {
+		if result.Results[i].UID == "alertmanager" {
+			alertmanagerResult = &result.Results[i]
+		}
+	}
+	require.NotNil(t, alertmanagerResult)
+	assert.Equal(t, "UNKNOWN", alertmanagerResult.Status)
+	assert.Empty(t, alertmanagerResult.Error, "must not surface the health endpoint's error for a plugin that was never asked")
+}
+
+// TestCheckDatasourcesHealth_BackendPluginUnknownStatusCountsAsUnhealthy
+// guards against overloading Status == "UNKNOWN" to mean two different
+// things: a plugin skipped for lacking a backend (issue #1069) versus a
+// backend plugin whose own /health endpoint legitimately reports UNKNOWN
+// (a real, inconclusive-or-failed result). Only the former belongs in the
+// Unknown tally; folding the latter in there would hide a real problem from
+// Unhealthy.
+func TestCheckDatasourcesHealth_BackendPluginUnknownStatusCountsAsUnhealthy(t *testing.T) {
+	list := []*models.DataSourceListItemDTO{
+		{ID: 1, UID: "prom-1", Name: "Prometheus", Type: "prometheus"},
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/api/datasources":
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(list)
+		case r.URL.Path == "/api/frontend/settings":
+			// This plugin has a backend, so it must actually be health-checked.
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"datasources": map[string]any{
+					"Prometheus": map[string]any{
+						"id": 1, "uid": "prom-1", "name": "Prometheus", "type": "prometheus",
+						"meta": map[string]any{"backend": true},
+					},
+				},
+			})
+		default:
+			// The backend plugin's own health endpoint reports UNKNOWN.
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "UNKNOWN", "message": "check not implemented"})
+		}
+	}))
+	defer srv.Close()
+
+	result, err := checkDatasourcesHealth(mockDatasourcesCtx(srv), BulkCheckDatasourceHealthParams{})
+	require.NoError(t, err)
+	assert.Equal(t, 0, result.Healthy)
+	assert.Equal(t, 1, result.Unhealthy, "a backend plugin's own UNKNOWN health result must count as unhealthy, not be hidden in Unknown")
+	assert.Equal(t, 0, result.Unknown, "Unknown is reserved for plugins skipped for lacking a backend")
+}
+
+func TestCheckDatasourcesHealth_FrontendSettingsUnavailableFallsBackToNormalCheck(t *testing.T) {
+	// No frontend/settings handler at all: fetchFrontendSettingsDatasources
+	// fails, and the bulk check must fall back to today's behavior (call the
+	// health endpoint for every datasource) rather than erroring out.
+	list := mockDatasourceList([]string{"ds-1"}, "prometheus")
+	srv := newBulkHealthServer(t, list, map[string]bool{"ds-1": true})
+	defer srv.Close()
+
+	result, err := checkDatasourcesHealth(mockDatasourcesCtx(srv), BulkCheckDatasourceHealthParams{})
+	require.NoError(t, err)
+	assert.Equal(t, 1, result.Healthy)
+	assert.Equal(t, 0, result.Unhealthy)
+	assert.Equal(t, 0, result.Unknown)
 }
 
 func TestCreateDatasource_SecureFieldsNotLeakedToJSONData(t *testing.T) {

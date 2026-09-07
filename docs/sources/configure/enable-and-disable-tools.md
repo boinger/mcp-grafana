@@ -36,7 +36,7 @@ Some tool categories are disabled by default:
 - **elasticsearch** – Elasticsearch query tool.
 - **quickwit** – Quickwit query tool.
 - **influxdb** – InfluxDB query tool (Flux and InfluxQL).
-- **agento11y** – Agent Observability tools for LLM conversations, generations, evaluation scores, agents, evaluators, eval rules, guards, saved conversations, and collections.
+- **agento11y** – Agent Observability tools for LLM conversations, generations, evaluation scores, agents, evaluators, eval rules, guards, saved conversations, collections, offline experiments, and the test suites those experiments run against.
 - **assistant** – Grafana Assistant tool (`ask_assistant`); requires the Grafana Assistant plugin and is write-gated.
 - **admin** – Admin tools (teams, users, roles, permissions).
 
@@ -56,7 +56,15 @@ For tools that come from external MCP servers through Grafana (for example from 
 
 ## Run in read-only mode
 
-Use `--disable-write` to disable all write operations. The server can still read dashboards, run queries, and list resources, but it cannot create or update dashboards, incidents, alert rules, annotations, snapshots, investigations, or Agent Observability evaluators, eval rules, guards, saved conversations, and collections.
+Use `--disable-write` to disable all write operations. The server can still read dashboards, run queries, and list resources, but it cannot create or update dashboards, incidents, alert groups, alert rules, annotations, snapshots, investigations, or Agent Observability evaluators, eval rules, guards, saved conversations, and collections.
+
+Read-only mode also removes `query_clickhouse`, `query_snowflake`, `query_athena`, and `query_influxdb`: they pass the query to the datasource unfiltered, so they can write whenever the datasource credentials permit it. Add `--enable-query` to keep them when those credentials are known to be read-only.
+
+## Run without query execution
+
+Use `--disable-query` to remove every tool that executes a query against a datasource, such as `query_prometheus`, `query_loki_logs`, `query_clickhouse`, and `run_panel_query`. The server can still list datasources and dashboards, explore metric names, labels, and table schemas, and generate deeplinks, but it can't run the queries themselves.
+
+`--disable-query` is the strongest of the three query settings: it wins over `--enable-query`, and it removes the query tools that `--disable-write` leaves in place. Refer to [Command-line flags](../command-line-flags/) for the full list of affected tools.
 
 ## Next steps
 
